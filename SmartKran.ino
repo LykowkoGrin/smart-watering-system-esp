@@ -9,59 +9,72 @@
 #include <Adafruit_BMP280.h>
 #include <vector>
 
-const char* ssid = "WiFi name";
-const char* password = "WiFi password";
-const char* botToken = "your bot token";
-const char* chatId = "your chat id";
+#include "SettingsParser.h"
+#include "IntervalTime.h"
+#include "LocalManager.h"
+#include "TelegramManager.h"
 
-const int eepromSize = 500;
+const int parsePin = 23;
 const int relayPin1 = 4;
-const int relayPin2 = relayPin1;
+
 const int keyAddress = 0;
-const int timerAddress = keyAddress + sizeof(uint8_t);
+const int parserAddress = keyAddress + sizeof(uint8_t);
+const int timerAddress = parserAddress + SettingsParser::getReservedSizeEEPROM();
 const int temperatureAddress = timerAddress + sizeof(uint32_t);
 const int intervalsAddress = temperatureAddress + sizeof(float);
+const int eepromSize = intervalsAddress + 150;
 
-const uint8_t eepromKey = 111;
+const uint8_t eepromKey = 110;
 
 const int CLOCK_DAT = 27;  
 const int CLOCK_CLK = 14;
 const int CLOCK_RST = 26;
 
-const int baseBotRequestDelay = 10'000;
-const int inputModeBotRequestDelay = 10'000;
-unsigned long lastTimeBotRan = 0;
+//const int baseBotRequestDelay = 10'000;
+//const int inputModeBotRequestDelay = 10'000;
+//unsigned long lastTimeBotRan = 0;
 bool relayStatus = false;
 bool isFirstInternetRequest = true;
+bool isParseSettingsMode = false;
 
+String chatId;
 Adafruit_BMP280 bmp;
 WiFiClientSecure client;
-UniversalTelegramBot bot(botToken, client);
+UniversalTelegramBot *bot;//(botToken, client);
 ThreeWire myWire(CLOCK_DAT, CLOCK_CLK, CLOCK_RST);
 RtcDS1302<ThreeWire> Rtc(myWire);
+
+LocalManager* localManager = nullptr;
+TelegramManager* telegramManager = nullptr;
+
 TaskHandle_t wifiTaskHandle = NULL;
+struct WiFiParams {
+  String ssid;
+  String password;
+};
 
 uint32_t stopTimerSec;
 float temperatureThreshold;
+std::vector<IntervalTime> intervals;
 
 //void connectToWiFi();
 void setupClock();
 void setupFirstTimeEEPROM();
-void handleMessage(int messageIndex);
+//void handleMessage(int messageIndex);
 
 void readIntervalsFromEEPROM();
 void saveIntervalsToEEPROM();
 
 void printDateTime(const RtcDateTime& dt);
-bool parseTime(const String& timeStr, uint8_t& hour, uint8_t& minute);
 
 void checkWiFiConnection(void * parameter) {
+  WiFiParams *params = (WiFiParams *) parameter;
   const uint8_t maxReconnectAttempts = 15;
   bool isFirstConnect = true;
   for(;;) {
     if (WiFi.status() != WL_CONNECTED) {
       uint8_t reconnectAttempts = 0;
-      WiFi.begin(ssid, password);
+      WiFi.begin(params->ssid, params->password);
       Serial.print("Подключение к WiFi");
       while(WiFi.status() != WL_CONNECTED && maxReconnectAttempts > reconnectAttempts){
         reconnectAttempts++;
@@ -71,7 +84,8 @@ void checkWiFiConnection(void * parameter) {
       Serial.println();
       if (WiFi.status() == WL_CONNECTED) {
         Serial.println("Подключено к Wi-Fi");
-        client.setInsecure();   // Отключаем проверку сертификатов, чтобы избежать проблем с SSL
+        client.setInsecure();
+        if(!isParseSettingsMode && localManager != nullptr) localManager->raiseServer("smartgate");
       } else {
         Serial.println("Не удалось подключиться к Wi-Fi");
       }
@@ -84,22 +98,44 @@ void checkWiFiConnection(void * parameter) {
 void setup() {
   // put your setup code here, to run once:
   pinMode(relayPin1,OUTPUT);
-  pinMode(relayPin2,OUTPUT);
+  pinMode(parsePin,INPUT);
   digitalWrite(relayPin1,relayStatus);
-  digitalWrite(relayPin2,relayStatus);
+  isParseSettingsMode = digitalRead(parsePin);
 
+  Serial.begin(115200);
+  EEPROM.begin(eepromSize);
+
+  SettingsParser parser(parserAddress);
+  if(isParseSettingsMode){
+    WiFi.softAP("Leonov's gate");
+    parser.raiseServer("smartgate");
+    while(true) parser.tickServer();
+  }
+  chatId = parser.getChatId();
+
+  bot = new UniversalTelegramBot(parser.getBotToken(), client);
+
+  ConstructPtrs constructPtrs;
+  constructPtrs.bmp = &bmp;
+  constructPtrs.bot = bot;
+  constructPtrs.relayStatus = &relayStatus;
+  constructPtrs.rtc = &Rtc;
+
+  localManager = new LocalManager(constructPtrs);
+  telegramManager = new TelegramManager(constructPtrs,10'000,10'000);  
+
+  WiFiParams *params = new WiFiParams();
+  params->ssid = parser.getSSID();
+  params->password = parser.getPassword();
   xTaskCreatePinnedToCore(
     checkWiFiConnection,  // Функция задачи
     "WiFiCheckTask",      // Название задачи
     4096,                 // Размер стека задачи
-    NULL,                 // Параметры для передачи в задачу
+    (void *)params,       // Параметры для передачи в задачу
     1,                    // Приоритет задачи
     &wifiTaskHandle,      // Хендл задачи
     1                     // Ядро для выполнения (0 или 1)
   );
-
-  Serial.begin(115200);
-  EEPROM.begin(eepromSize);
 
   if(EEPROM.read(keyAddress) != eepromKey){
     Serial.println("Прочитанный ключ: " + String(EEPROM.read(keyAddress)));
@@ -117,7 +153,7 @@ void setup() {
 
   if(!bmp.begin(0x76)){
     vTaskDelay(5'000 / portTICK_PERIOD_MS);
-    bot.sendMessage(chatId, "Датчик температуры не подключен");
+    bot->sendMessage(chatId, "Датчик температуры не подключен");
   }
   else{
     bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     /* Operating Mode. */
@@ -126,47 +162,21 @@ void setup() {
                   Adafruit_BMP280::FILTER_X16,      /* Filtering. */
                   Adafruit_BMP280::STANDBY_MS_1000); /* Standby time. */
   }
-
-
-  //connectToWiFi();
 }
-
-struct IntervalTime {
-  bool inInterval(const RtcDateTime& dt){
-    uint32_t dtInSec = dt.Hour() * 3600 + dt.Minute() * 60;
-    if(start < stop)
-      return start <= dtInSec && dtInSec <= stop;
-    if(start > stop){
-      if(start <= dtInSec) return true;
-      if(stop >= dtInSec) return true;
-    }
-  }
-  String toString(){
-    RtcDateTime startDt= RtcDateTime(start);
-    RtcDateTime stopDt= RtcDateTime(stop);
-    String startStr = String(startDt.Hour()) + ":" + String(startDt.Minute());
-    String stopStr = String(stopDt.Hour()) + ":" + String(stopDt.Minute());
-    return startStr + "-" + stopStr;
-  }
-  uint32_t start;
-  uint32_t stop;
-};
-
-std::vector<IntervalTime> intervals;
-
+/*
 class Dialog{
 public:
   bool processNewMessage(const String& msg){
     if(stage == processStage::none){
       if(msg != "/полив") return false;
-      bool isSend = bot.sendMessage(chatId, "Введите число от 1 до 4:\n1 - включить полив на некторое время\n2 - добавить интервал включения полива\n3 - установить температурный порог включения полива\n4 - убрать один из интревалов включения полива");
+      bool isSend = bot->sendMessage(chatId, "Введите число от 1 до 4:\n1 - включить полив на некторое время\n2 - добавить интервал включения полива\n3 - установить температурный порог включения полива\n4 - убрать один из интревалов включения полива");
       if(!isSend) ESP.restart();
       stage = processStage::chooseInput;
       return true;
     }
     else if(stage == processStage::chooseInput){
       if(msg.length() != 1){
-        if(!bot.sendMessage(chatId,"Кол-во символов более 1!")) ESP.restart();
+        if(!bot->sendMessage(chatId,"Кол-во символов более 1!")) ESP.restart();
         stage = processStage::none;
         return false;
       }
@@ -176,30 +186,30 @@ public:
         num = std::stoi(msg.c_str());
       }
       catch(std::exception ex){
-        if(!bot.sendMessage(chatId,"Неверный формат!")) ESP.restart();
+        if(!bot->sendMessage(chatId,"Неверный формат!")) ESP.restart();
         stage = processStage::none;
         return false;
       }
 
       if(num < 1 || num > 4){
-        if(!bot.sendMessage(chatId,"Цифра должна быть от 1 до 4!")) ESP.restart();
+        if(!bot->sendMessage(chatId,"Цифра должна быть от 1 до 4!")) ESP.restart();
         stage = processStage::none;
         return false;
       }
 
       switch(num){
         case 1:
-          if(!bot.sendMessage(chatId,"Введите время, на которое будет включен полив в формате: \"час:минута\". Час и минута могут быть более чем 24 и 60, но не более 256.")) 
+          if(!bot->sendMessage(chatId,"Введите время, на которое будет включен полив в формате: \"час:минута\". Час и минута могут быть более чем 24 и 60, но не более 256.")) 
             ESP.restart();
           stage = processStage::timerInput;
           break;
         case 2:
-          if(!bot.sendMessage(chatId,"Введите начало и конец включения в формате: \"час:минута-час:минута\". Если начало будет больше чем конец, то выключение произоёдет через 24 часа.")) 
+          if(!bot->sendMessage(chatId,"Введите начало и конец включения в формате: \"час:минута-час:минута\". Если начало будет больше чем конец, то выключение произоёдет через 24 часа.")) 
             ESP.restart();
           stage = processStage::intervalInput;
           break;
         case 3:
-          if(!bot.sendMessage(chatId,"Введите порог температуры. Можно использовать не целые числа.")) 
+          if(!bot->sendMessage(chatId,"Введите порог температуры. Можно использовать не целые числа.")) 
             ESP.restart();
           stage = processStage::temperatureInput;
           break;
@@ -208,7 +218,7 @@ public:
           for(int i = 0 ; i < intervals.size(); i ++){
             intervalsStr += "\n" + String(i) + ") " + intervals[i].toString();
           }
-          if(!bot.sendMessage(chatId,"Введите номер удаляемого интервала:" + intervalsStr)) ESP.restart();
+          if(!bot->sendMessage(chatId,"Введите номер удаляемого интервала:" + intervalsStr)) ESP.restart();
           stage = processStage::delIntervalInput;
           break;
       }
@@ -218,18 +228,18 @@ public:
     else if(stage == processStage::timerInput){
       if(msg.length() < 3){
         stage = processStage::none;
-        if(!bot.sendMessage(chatId,"Неверный формат!")) ESP.restart();
+        if(!bot->sendMessage(chatId,"Неверный формат!")) ESP.restart();
         return false;
       }
       uint8_t h,m;
-      if(!parseTime(msg,h,m)){
+      if(!IntervalTime::parseTime(msg,h,m)){
         stage = processStage::none;
-        if(!bot.sendMessage(chatId,"Неверный формат!")) ESP.restart();
+        if(!bot->sendMessage(chatId,"Неверный формат!")) ESP.restart();
         return false;
       }
       RtcDateTime now = Rtc.GetDateTime();
       stopTimerSec = now.TotalSeconds() + h * 3600 + m * 60;
-      if(!bot.sendMessage(chatId,"Таймер установлен на " + String(h) + " часов и " + String(m) + " минут")) ESP.restart();
+      if(!bot->sendMessage(chatId,"Таймер установлен на " + String(h) + " часов и " + String(m) + " минут")) ESP.restart();
       EEPROM.put(timerAddress,stopTimerSec);
       EEPROM.commit();
       stage = processStage::none;
@@ -238,31 +248,31 @@ public:
     else if(stage == processStage::intervalInput){
       if(msg.length() < 7){
         stage = processStage::none;
-        if(!bot.sendMessage(chatId,"Неверный формат!")) ESP.restart();
+        if(!bot->sendMessage(chatId,"Неверный формат!")) ESP.restart();
         return false;
       }
       int delimiterIndex = msg.indexOf('-');
       if(delimiterIndex == -1){
         stage = processStage::none;
-        if(!bot.sendMessage(chatId,"Тире не найдено!")) ESP.restart();
+        if(!bot->sendMessage(chatId,"Тире не найдено!")) ESP.restart();
         return false;
       }
 
       String startStr = msg.substring(0, delimiterIndex);
       String stopStr = msg.substring(delimiterIndex + 1);
       uint8_t startH,startM,stopH,stopM;
-      if(!parseTime(startStr, startH, startM) || !parseTime(stopStr, stopH, stopM)){
+      if(!IntervalTime::parseTime(startStr, startH, startM) || !IntervalTime::parseTime(stopStr, stopH, stopM)){
         stage = processStage::none;
-        if(!bot.sendMessage(chatId,"Неверный формат!")) ESP.restart();
+        if(!bot->sendMessage(chatId,"Неверный формат!")) ESP.restart();
         return false;
       }
       if(startH > 23 || startM > 59 || stopH > 23 || stopM > 59){
         stage = processStage::none;
-        if(!bot.sendMessage(chatId,"Час не должен быть больше 23 и минута больше чем 59!")) ESP.restart();
+        if(!bot->sendMessage(chatId,"Час не должен быть больше 23 и минута больше чем 59!")) ESP.restart();
         return false;
       }
       String intervalSetResponse = "Добавлен интревал с " + String(startH) + ":" + String(startM) + " до " + String(stopH) + ":" + String(stopM);
-      if(!bot.sendMessage(chatId,intervalSetResponse)) ESP.restart();
+      if(!bot->sendMessage(chatId,intervalSetResponse)) ESP.restart();
       IntervalTime inTime;
       inTime.start = startH * 3600 + startM * 60;
       inTime.stop = stopH * 3600 + stopM * 60;
@@ -278,18 +288,18 @@ public:
         index = std::stoi(msg.c_str());
       }
       catch(std::exception ex){
-        if(!bot.sendMessage(chatId,"Неверный формат!")) ESP.restart();
+        if(!bot->sendMessage(chatId,"Неверный формат!")) ESP.restart();
         stage = processStage::none;
         return false;
       }
 
       if(index < 0 || index >= intervals.size()){
-        if(!bot.sendMessage( chatId,"Число должно быть больше 0 и меньше чем " + String(intervals.size()) )) ESP.restart();
+        if(!bot->sendMessage( chatId,"Число должно быть больше 0 и меньше чем " + String(intervals.size()) )) ESP.restart();
         stage = processStage::none;
         return false;
       }
 
-      if(!bot.sendMessage( chatId, "Интревал " + intervals[index].toString() + " будет удалён")) ESP.restart();
+      if(!bot->sendMessage( chatId, "Интревал " + intervals[index].toString() + " будет удалён")) ESP.restart();
       intervals.erase(intervals.begin()+index);
       
       stage = processStage::none;
@@ -304,10 +314,10 @@ public:
         tempVal = std::stof(niceFormatMsg.c_str());
       }
       catch(std::exception ex){
-        if(!bot.sendMessage(chatId,"Неверный формат!")) ESP.restart();
+        if(!bot->sendMessage(chatId,"Неверный формат!")) ESP.restart();
         return false;
       }
-      if(!bot.sendMessage(chatId,"Температурный порог установлен на " + String(tempVal))) ESP.restart();
+      if(!bot->sendMessage(chatId,"Температурный порог установлен на " + String(tempVal))) ESP.restart();
       temperatureThreshold = tempVal;
       EEPROM.put(temperatureAddress,temperatureThreshold);
       EEPROM.commit();
@@ -334,28 +344,55 @@ private:
 };
 
 Dialog dialog;
-
+*/
 void loop() {
   // put your main code here, to run repeatedly:
   if (WiFi.status() == WL_CONNECTED){
     if(isFirstInternetRequest){
       Serial.println("Попытка сделать первый запрос");
-      if(bot.sendMessage(chatId, "кран перезагружен")){
+      if(bot->sendMessage(chatId, "кран перезагружен")){
         Serial.println("Первый запрос успешен");
         isFirstInternetRequest = false;
-        bot.getUpdates(-1);
+        bot->getUpdates(-1);
       }
     }
   }
   if (WiFi.status() == WL_CONNECTED) {
+    ChangePtrs changePtrs;
+    changePtrs.intervals = &intervals;
+    changePtrs.stopTimerSec = &stopTimerSec;
+    changePtrs.temperatureThreshold = &temperatureThreshold;
+
+    int oldIntervalsSize = intervals.size();
+    uint32_t oldTimer = stopTimerSec;
+    float oldThreshold = temperatureThreshold;
+
+    localManager->tickServer(changePtrs);
+    telegramManager->tickBot(changePtrs);
+
+    if(oldIntervalsSize != intervals.size()) {
+      saveIntervalsToEEPROM();
+    }
+    if(oldTimer != stopTimerSec){
+      EEPROM.put(timerAddress,stopTimerSec);
+      EEPROM.commit();
+    }
+    if(oldThreshold != temperatureThreshold){
+      EEPROM.put(temperatureAddress,temperatureThreshold);
+      EEPROM.commit();
+    }
+    /*
     if (millis() - lastTimeBotRan > (dialog.inProcess() ? inputModeBotRequestDelay : baseBotRequestDelay)) {
-      int messageCount = bot.getUpdates(-1);
+      int messageCount = bot->getUpdates(-1);
       if (messageCount > 0) {
         handleMessage(messageCount - 1);
       }
 
       lastTimeBotRan = millis();
     }
+    */
+
+
   }
 
   RtcDateTime now = Rtc.GetDateTime();
@@ -373,14 +410,12 @@ void loop() {
     if(!relayStatus){
       relayStatus = true;
       digitalWrite(relayPin1,relayStatus);
-      digitalWrite(relayPin2,relayStatus);
     }
   }
   else{
     if(relayStatus){
       relayStatus = false;
       digitalWrite(relayPin1,relayStatus);
-      digitalWrite(relayPin2,relayStatus);
     }
   }
 
@@ -392,11 +427,11 @@ void loop() {
   vTaskDelay(1000 / portTICK_PERIOD_MS); //секунда
 }
 
-
+/*
 void handleMessage(int messageIndex){
   if(messageIndex < 0) return;
-  String messageText = bot.messages[messageIndex].text;
-  Serial.println(bot.messages[messageIndex].chat_id);
+  String messageText = bot->messages[messageIndex].text;
+  Serial.println(bot->messages[messageIndex].chat_id);
 
   if(dialog.processNewMessage(messageText)){
     
@@ -419,7 +454,7 @@ void handleMessage(int messageIndex){
     String relayInfo = relayStatus ? "Полив включен" : "Полив выключен";
     String temperatureInfo = "Температурный порог: " + String(temperatureThreshold) + ". Актуальная температура: " + String(bmp.readTemperature());
     
-    if(bot.sendMessage(bot.messages[messageIndex].chat_id, intervalsInfo + "\n" + timerInfo + "\n" + temperatureInfo + "\n" + relayInfo)){
+    if(bot->sendMessage(chatId, intervalsInfo + "\n" + timerInfo + "\n" + temperatureInfo + "\n" + relayInfo)){
       
     }
     else{
@@ -428,37 +463,16 @@ void handleMessage(int messageIndex){
   }
 
 }
-
+*/
 void setupFirstTimeEEPROM(){
   EEPROM.write(keyAddress,eepromKey);
+  for(int i = 0;i < SettingsParser::getReservedSizeEEPROM();i++){
+    EEPROM.write(parserAddress + i,0);
+  }
   EEPROM.put(temperatureAddress,1000.0f);
   EEPROM.put(timerAddress,(uint32_t)0);
   EEPROM.write(intervalsAddress,0);
   EEPROM.commit();
-}
-
-void connectToWiFi() {
-  const int maxReconnectAttempts = 10;
-  int reconnectAttempts = 0;
-
-  Serial.println("Подключение к WiFi...");
-  WiFi.begin(ssid, password);
-  
-  // Ограничиваем количество попыток подключения
-  while (WiFi.status() != WL_CONNECTED && reconnectAttempts < maxReconnectAttempts) {
-    delay(1000);
-    Serial.print(".");
-    reconnectAttempts++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nПодключено к Wi-Fi");
-    reconnectAttempts = 0; // Сбрасываем количество попыток после успешного подключения
-    client.setInsecure();   // Отключаем проверку сертификатов, чтобы избежать проблем с SSL
-  } else {
-    Serial.println("\nНе удалось подключиться к Wi-Fi");
-    ESP.restart();
-  }
 }
 
 void printDateTime(const RtcDateTime& dt) {
@@ -526,35 +540,4 @@ void saveIntervalsToEEPROM(){
     EEPROM.put(intervalsAddress + sizeof(uint8_t) + i * sizeof(IntervalTime),intervals[i]);
   }
   EEPROM.commit();
-}
-
-bool isNumeric(const String& str) {
-    for (unsigned int i = 0; i < str.length(); i++) {
-        if (!isDigit(str[i])) {
-            return false; // Если встречен нечисловой символ
-        }
-    }
-    return true;
-}
-
-bool parseTime(const String& timeStr, uint8_t& hour, uint8_t& minute) {
-    int colonIndex = timeStr.indexOf(':');
-    
-    // Проверка, есть ли двоеточие и корректен ли формат
-    if (colonIndex == -1) {
-        return false; // Нет двоеточия
-    }
-
-    // Извлекаем часы и минуты
-    String hourStr = timeStr.substring(0, colonIndex);
-    String minuteStr = timeStr.substring(colonIndex + 1);
-
-    // Проверяем, что обе части строки являются числами
-    if (isNumeric(hourStr) && isNumeric(minuteStr)) {
-        hour = hourStr.toInt();
-        minute = minuteStr.toInt();
-        return true; // Успешный парсинг
-    }
-
-    return false; // Некорректный формат
 }
