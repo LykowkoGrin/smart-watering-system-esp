@@ -15,17 +15,23 @@ public:
   String getPassword();
   String getBotToken();
   String getChatId();
+  String getUserId();
+  String getMqttPassword();
 private:
   String ssid;
   String password;
   String botToken;
   String chatId;
+  String userId;
+  String mqttPassword;
   int eepromAddress;
 
   static const int ssidSize;
   static const int passwordSize;
   static const int botTokenSize;
   static const int chatIdSize;
+  static const int userIdSize;
+  static const int mqttPasswordSize;
 
   WebServer* server;
 
