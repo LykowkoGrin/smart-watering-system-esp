@@ -44,7 +44,7 @@ void LocalManager::handleNewClient() {
   html += "<input type='submit' value='Сохранить'>";
   html += "</form><br>";
 
-  html += "<h2>Список элементов</h2>";
+  html += "<h2>Список интервалов</h2>";
   html += "<ul>";
   for (size_t i = 0; i < intervals->size(); ++i) {
       html += "<li>" + (*intervals)[i].toString();
@@ -57,7 +57,7 @@ void LocalManager::handleNewClient() {
   html += "</ul>";
 
   html += "<form action='/add_item' method='POST'>";
-  html += "Новый элемент: <input type='text' name='new_item'>";
+  html += "Новый интервал: <input type='text' name='new_item'>";
   html += "<input type='submit' value='Добавить'>";
   html += "</form>";
 
