@@ -5,7 +5,11 @@ ClusterflyManager::ClusterflyManager(const ConstructPtrs& params,String userId,S
   this->updateDelay = updateDelay;
   rtc         = params.rtc;
   relayStatus = params.relayStatus;
+  lastLitersPerMinute = params.lastLitersPerMinute;
   bmp         = params.bmp;
+  bmpMutex    = params.bmpMutex;
+  rtcMutex    = params.rtcMutex;
+
   this->userId = userId;
   this->password = password;
   mqtt = new PubSubClient(*(params.client));
@@ -18,6 +22,11 @@ ClusterflyManager::ClusterflyManager(const ConstructPtrs& params,String userId,S
   logsTopic = userIdForm + logsTopic;
   tempTopic = userIdForm + tempTopic;
   delIntervalsTopic = userIdForm + delIntervalsTopic;
+  
+  maxFlowTopic = userIdForm + maxFlowTopic;
+  ignoreCountTopic = userIdForm + ignoreCountTopic;
+  flowTopic = userIdForm + flowTopic;
+  flowBlockTopic = userIdForm + flowBlockTopic;
 
   mqtt->setServer("srv2.clusterfly.ru", 9992);
 }
@@ -26,6 +35,10 @@ void ClusterflyManager::tickMqtt(const ChangePtrs& params){
   intervals = params.intervals;
   stopTimerSec = params.stopTimerSec;
   temperatureThreshold = params.temperatureThreshold;
+  maxLitersPerMinute = params.maxLitersPerMinute;
+  ignoreAfterTurningOn = params.ignoreAfterTurningOn;
+  flowExceededMaxValue = params.flowExceededMaxValue;
+  mutex = params.mutex;
   
   if(!mqtt->connected()) connectToMqtt();
   if(!mqtt->connected()) return;
@@ -52,15 +65,20 @@ void ClusterflyManager::handleMessage(char* topic, byte* payload, unsigned int l
   else if(strTopic == intervalTopic) processIntervalTopic(payload, length);
   else if(strTopic == timerTopic) processTimerTopic(payload, length);
   else if(strTopic == delIntervalsTopic) processDeleteTopic(payload, length);
+  else if(strTopic == maxFlowTopic) processMaxFlowTopic(payload, length);
+  else if(strTopic == ignoreCountTopic) processIgnoreCountTopic(payload, length);
 }
 
 void ClusterflyManager::connectToMqtt(){
-  mqtt->connect("esp32_mytest", userId.c_str(), password.c_str());
+  mqtt->connect("esptest2", userId.c_str(), password.c_str());
 
   mqtt->subscribe(tempThresholdTopic.c_str());
   mqtt->subscribe(intervalTopic.c_str());
   mqtt->subscribe(timerTopic.c_str());
   mqtt->subscribe(delIntervalsTopic.c_str());
+
+  mqtt->subscribe(maxFlowTopic.c_str());
+  mqtt->subscribe(ignoreCountTopic.c_str());
 
   instance = this;
   mqtt->setCallback(mqttCallback);
@@ -69,8 +87,22 @@ void ClusterflyManager::connectToMqtt(){
 void ClusterflyManager::updateData(){
   if(millis() - lastRequestTime < minRequestDelay) vTaskDelay(minRequestDelay / portTICK_PERIOD_MS);
   mqtt->publish(statusTopic.c_str(),String(*relayStatus).c_str());
-  vTaskDelay(1500 / portTICK_PERIOD_MS);
+
+  vTaskDelay(minRequestDelay / portTICK_PERIOD_MS);
+  mqtt->publish(flowBlockTopic.c_str(),String(*flowExceededMaxValue).c_str());
+
+
+  vTaskDelay(minRequestDelay / portTICK_PERIOD_MS);
+  xSemaphoreTake(bmpMutex, portMAX_DELAY);
   mqtt->publish(tempTopic.c_str(),String(bmp->readTemperature()).c_str());
+  xSemaphoreGive(bmpMutex);
+
+  vTaskDelay(minRequestDelay / portTICK_PERIOD_MS);
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  float nowFlow = *lastLitersPerMinute;
+  xSemaphoreGive(mutex);
+  mqtt->publish(flowTopic.c_str(),String(nowFlow).c_str());
+  
   lastRequestTime = millis();
 }
 
@@ -82,7 +114,9 @@ void ClusterflyManager::processTempTopic(byte* payload, unsigned int length){
     t = std::stof(String(payload,length).c_str());
     String strResp = "Порог установлен на: " + String(t);
     if(mqtt->publish(logsTopic.c_str(),strResp.c_str())){
+      xSemaphoreTake(mutex, portMAX_DELAY);
       *temperatureThreshold = t;
+      xSemaphoreGive(mutex);
     }
   }
   catch(std::exception ex){
@@ -95,7 +129,11 @@ void ClusterflyManager::processDeleteTopic(byte* payload, unsigned int length){
   if(millis() - lastRequestTime < minRequestDelay) vTaskDelay(minRequestDelay / portTICK_PERIOD_MS);
 
   if(mqtt->publish(logsTopic.c_str(),"Интервалы удалены")){
+
+    xSemaphoreTake(mutex, portMAX_DELAY);
     intervals->clear();
+    xSemaphoreGive(mutex);
+
     lastRequestTime = millis();
   }
 }
@@ -125,7 +163,11 @@ void ClusterflyManager::processIntervalTopic(byte* payload, unsigned int length)
   inTime.stop = h2 * 3600 + m2 * 60;
   String reqStr = String("Добавлен интревал ") + String(inTime.start) + String(":") + String(inTime.stop);
   if(mqtt->publish(logsTopic.c_str(),reqStr.c_str())){
+
+    xSemaphoreTake(mutex, portMAX_DELAY);
     intervals->push_back(inTime);
+    xSemaphoreGive(mutex);
+
     lastRequestTime = millis();
   }
 }
@@ -140,12 +182,57 @@ void ClusterflyManager::processTimerTopic(byte* payload, unsigned int length){
     lastRequestTime = millis();
     return;
   }
-  uint32_t nowSec = (rtc->GetDateTime()).TotalSeconds();
+
+  uint32_t nowSec;
+  if(xSemaphoreTake(rtcMutex, portMAX_DELAY)){
+    nowSec = (rtc->GetDateTime()).TotalSeconds();
+    xSemaphoreGive(rtcMutex);
+  }
+
   String req = String("Таймер остановится через ") + String((sec - nowSec) / 60.f) + String(" минут");
   if(mqtt->publish(logsTopic.c_str(), req.c_str())){
+    xSemaphoreTake(mutex, portMAX_DELAY);
     *stopTimerSec = sec;
+    xSemaphoreGive(mutex);
     lastRequestTime = millis();
   }
+}
+
+void ClusterflyManager::processMaxFlowTopic(byte* payload, unsigned int length){
+  if(millis() - lastRequestTime < minRequestDelay) vTaskDelay(minRequestDelay / portTICK_PERIOD_MS);
+
+  float t;
+  try{
+    t = std::stof(String(payload,length).c_str());
+    String strResp = "Максимальный поток: " + String(t);
+    if(mqtt->publish(logsTopic.c_str(),strResp.c_str())){
+      xSemaphoreTake(mutex, portMAX_DELAY);
+      *maxLitersPerMinute = t;
+      xSemaphoreGive(mutex);
+    }
+  }
+  catch(std::exception ex){
+    mqtt->publish(logsTopic.c_str(),"неверный формат");
+  }
+  lastRequestTime = millis();
+}
+void ClusterflyManager::processIgnoreCountTopic(byte* payload, unsigned int length){
+  if(millis() - lastRequestTime < minRequestDelay) vTaskDelay(minRequestDelay / portTICK_PERIOD_MS);
+
+  int t;
+  try{
+    t = std::stoi(String(payload,length).c_str());
+    String strResp = "Количество игнорирований: " + String(t);
+    if(mqtt->publish(logsTopic.c_str(),strResp.c_str())){
+      xSemaphoreTake(mutex, portMAX_DELAY);
+      *ignoreAfterTurningOn = t;
+      xSemaphoreGive(mutex);
+    }
+  }
+  catch(std::exception ex){
+    mqtt->publish(logsTopic.c_str(),"неверный формат");
+  }
+  lastRequestTime = millis();
 }
 
 bool ClusterflyManager::convertTimeToSec(const String& dateTime, uint32_t& seconds){

@@ -5,11 +5,13 @@
 
 class SettingsParser{
 public:
-  SettingsParser(int eepromAddress);
+  SettingsParser(int eepromAddress,bool writeOnly);
 
   void raiseServer(const String& serverName);
   void tickServer();
   static int getReservedSizeEEPROM();
+
+  void updateIPConfig(IPAddress staticIP, IPAddress gateway, IPAddress subnet, IPAddress primaryDNS, IPAddress secondaryDNS);
 
   String getSSID();
   String getPassword();
@@ -17,6 +19,12 @@ public:
   String getChatId();
   String getUserId();
   String getMqttPassword();
+
+  IPAddress getStaticIP();
+  IPAddress getGateway();
+  IPAddress getSubnet(); 
+  IPAddress getPrimaryDNS();
+  IPAddress getSecondaryDNS();
 private:
   String ssid;
   String password;
@@ -24,6 +32,14 @@ private:
   String chatId;
   String userId;
   String mqttPassword;
+
+
+  IPAddress staticIP;
+  IPAddress gateway;
+  IPAddress subnet; 
+  IPAddress primaryDNS;
+  IPAddress secondaryDNS;
+
   int eepromAddress;
 
   static const int ssidSize;
@@ -32,6 +48,7 @@ private:
   static const int chatIdSize;
   static const int userIdSize;
   static const int mqttPasswordSize;
+  static const int IP4Size;
 
   WebServer* server;
 
@@ -41,8 +58,13 @@ private:
   void handleNewClient();
   void handleForm();
 
+  void writeIPToEEPROM(int eepromAddress,IPAddress ip);
+  IPAddress readIPFromEEPROM(int eepromAddress);
   void writeStringToEEPROM(int eepromAddress,const String& str);
   String readStringFromEEPROM(int eepromAddress);
+
+  String convertIPToStr(IPAddress ip);
+  bool convertStrToIP(const String& ipStr,IPAddress& ip);
 };
 
 

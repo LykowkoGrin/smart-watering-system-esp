@@ -1,3 +1,9 @@
+
+/*
+Cкетч компилируется примерно 5 минут: https://vkvideo.ru/video620293254_456239025?t=5m57s
+*/
+
+
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
@@ -16,38 +22,43 @@
 #include "TelegramManager.h"
 #include "ClusterflyManager.h"
 
-const int parsePin = 23;
-const int relayPin1 = 4;
+const int parsePin = 19;
+const int relayPin = 4;
+const int flowPin = 2;
 
 const int keyAddress = 0;
 const int parserAddress = keyAddress + sizeof(uint8_t);
 const int timerAddress = parserAddress + SettingsParser::getReservedSizeEEPROM();
 const int temperatureAddress = timerAddress + sizeof(uint32_t);
-const int intervalsAddress = temperatureAddress + sizeof(float);
+const int maxFlowAddress = temperatureAddress + sizeof(float);
+const int ignoreCountAddress = maxFlowAddress + sizeof(float);
+
+const int intervalsAddress = ignoreCountAddress + sizeof(uint8_t);
 const int eepromSize = intervalsAddress + 150;
 
-const uint8_t eepromKey = 115;
-/*
-const int CLOCK_DAT = 27;  
-const int CLOCK_CLK = 14;
-const int CLOCK_RST = 26;
-*/
+const uint8_t eepromKey = 137;
+const float pulsesPerLiter = 300.0f;
+
 const int CLOCK_DAT = 23; // DATA (IO)
 const int CLOCK_CLK = 18; // CLOCK
 const int CLOCK_RST = 5;  // CE (RST)
 
 bool relayStatus = false;
-bool isFirstInternetRequest = true;
 bool isParseSettingsMode = false;
 
 String chatId;
-Adafruit_BMP280 bmp;
+
 WiFiClientSecure client;
 WiFiClientSecure client2;
-UniversalTelegramBot *bot;//(botToken, client);
+UniversalTelegramBot *bot;
+
+Adafruit_BMP280 bmp;
+SemaphoreHandle_t bmpMutex = xSemaphoreCreateMutex();
+
 ThreeWire myWire(CLOCK_DAT, CLOCK_CLK, CLOCK_RST);
 RtcDS1302<ThreeWire> Rtc(myWire);
-//PubSubClient mqtt(client);
+SemaphoreHandle_t rtcMutex = xSemaphoreCreateMutex();
+
 
 LocalManager* localManager = nullptr;
 TelegramManager* telegramManager = nullptr;
@@ -57,30 +68,92 @@ TaskHandle_t wifiTaskHandle = NULL;
 struct WiFiParams {
   String ssid;
   String password;
+
+  bool staticIpParamsMustBeInit;
+
+  IPAddress staticIP;
+  IPAddress gateway;
+  IPAddress subnet; 
+  IPAddress primaryDNS;
+  IPAddress secondaryDNS;
+
 };
+
+WiFiParams updatedWiFiParams;
+bool wifiParamsMustBeSaved = false;
 
 uint32_t stopTimerSec;
 float temperatureThreshold;
 std::vector<IntervalTime> intervals;
+float lastLitersPerMinute = 0.0f;
+float maxLitersPerMinute = 0.0f;
+uint8_t ignoreAfterTurningOn = 0;
+bool flowExceededMaxValue = false; //больше ничего и не надо будет. Не заюудь за ночь
+SemaphoreHandle_t mutex = xSemaphoreCreateMutex(); //это на строчки выше тема. Вотч демо вотч демо ww
 
-//void connectToWiFi();
+uint32_t flowUpdatesAfterTurningOn = 0; //Счетчик количества измерений после включения
+unsigned long lastFlowUpdate = 0;
+volatile int pulseCount = 0;    // Счетчик импульсов
+portMUX_TYPE pulseCountMux = portMUX_INITIALIZER_UNLOCKED; // Для атомарных операций
+void IRAM_ATTR pulseCounter() {
+  portENTER_CRITICAL_ISR(&pulseCountMux);
+  pulseCount++;
+  portEXIT_CRITICAL_ISR(&pulseCountMux);
+}
+
+void turnOnRelay();
+void turnOffRelay();
 void setupClock();
 void setupFirstTimeEEPROM();
-//void handleMessage(int messageIndex);
 
 void readIntervalsFromEEPROM();
 void saveIntervalsToEEPROM();
 
 void printDateTime(const RtcDateTime& dt);
 
+void botTask(void *pvParameters);
+void mqttTask(void *pvParameters);
+void localServTask(void *pvParameters);
+
 void checkWiFiConnection(void * parameter) {
+  //WiFi.persistent(false);
+
+  //WiFi.mode(WIFI_STA);
+
+  //WiFi.disconnect(true);
+
+  //vTaskDelay(pdMS_TO_TICKS(5000));
+
   WiFiParams *params = (WiFiParams *) parameter;
   const uint8_t maxReconnectAttempts = 15;
   bool isFirstConnect = true;
+
+  bool staticConnIsInited = (params->staticIP != IPAddress(0,0,0,0));
+  Serial.println("wifi params: ");
+
+  Serial.println(params->staticIP);
+  Serial.println(params->gateway);
+  Serial.println(params->subnet);
+  Serial.println(params->primaryDNS);
+  Serial.println(params->secondaryDNS);
+  Serial.println(staticConnIsInited);
+/*
+  if(staticConnIsInited) WiFi.config(params->staticIP, 
+                                      params->gateway, 
+                                      params->subnet, 
+                                      params->primaryDNS, 
+                                      params->secondaryDNS);
+*/
+  bool serverIsRaised = false;
   for(;;) {
     if (WiFi.status() != WL_CONNECTED) {
       uint8_t reconnectAttempts = 0;
+
+
+
       WiFi.begin(params->ssid, params->password);
+
+      
       Serial.print("Подключение к WiFi");
       while(WiFi.status() != WL_CONNECTED && maxReconnectAttempts > reconnectAttempts){
         reconnectAttempts++;
@@ -92,9 +165,22 @@ void checkWiFiConnection(void * parameter) {
         Serial.println("Подключено к Wi-Fi");
         client.setInsecure();
         client2.setInsecure();
-        if(!isParseSettingsMode && localManager != nullptr) {
+        if(!serverIsRaised && localManager != nullptr) {
           localManager->raiseServer("smartgate");
+          serverIsRaised = true;
         }
+        
+
+        if(!staticConnIsInited){
+          updatedWiFiParams.staticIP = WiFi.localIP();
+          updatedWiFiParams.gateway = WiFi.gatewayIP();
+          updatedWiFiParams.subnet = WiFi.subnetMask();
+          updatedWiFiParams.primaryDNS = WiFi.dnsIP(0);
+          updatedWiFiParams.secondaryDNS = WiFi.dnsIP(1);
+
+          wifiParamsMustBeSaved = true;
+        }
+
         
       } else {
         Serial.println("Не удалось подключиться к Wi-Fi");
@@ -107,15 +193,23 @@ void checkWiFiConnection(void * parameter) {
 
 void setup() {
   // put your setup code here, to run once:
-  pinMode(relayPin1,OUTPUT);
+  pinMode(relayPin,OUTPUT);
   pinMode(parsePin,INPUT);
-  digitalWrite(relayPin1,relayStatus);
+  pinMode(flowPin, INPUT_PULLUP);
+  digitalWrite(relayPin,relayStatus); //удалишь - убью
   isParseSettingsMode = digitalRead(parsePin);
+  
+  lastFlowUpdate = millis();
+  // Настройка прерывания на спад сигнала
+  attachInterrupt(digitalPinToInterrupt(flowPin), 
+                 pulseCounter, 
+                 FALLING);
+  
 
   Serial.begin(115200);
   EEPROM.begin(eepromSize);
 
-  SettingsParser parser(parserAddress);
+  SettingsParser parser(parserAddress,false);
   if(isParseSettingsMode){
     WiFi.softAP("Leonov's gate");
     parser.raiseServer("smartgate");
@@ -129,16 +223,38 @@ void setup() {
   constructPtrs.bmp = &bmp;
   constructPtrs.bot = bot;
   constructPtrs.relayStatus = &relayStatus;
+  constructPtrs.lastLitersPerMinute = &lastLitersPerMinute;
   constructPtrs.rtc = &Rtc;
   constructPtrs.client = &client2;
+  constructPtrs.bmpMutex = bmpMutex;
+  constructPtrs.rtcMutex = rtcMutex;
 
   localManager = new LocalManager(constructPtrs);
+  ChangePtrs chPtrs;
+  chPtrs.intervals = &intervals;
+  chPtrs.stopTimerSec = &stopTimerSec;
+  chPtrs.temperatureThreshold = &temperatureThreshold;
+  chPtrs.ignoreAfterTurningOn = &ignoreAfterTurningOn;
+  chPtrs.maxLitersPerMinute = &maxLitersPerMinute;
+  chPtrs.flowExceededMaxValue = &flowExceededMaxValue;
+  chPtrs.mutex = mutex;
+  localManager->setChangePtrs(chPtrs);
+
   if(bot != nullptr) telegramManager = new TelegramManager(constructPtrs,10'000,10'000);
   if(parser.getUserId() != "" && parser.getMqttPassword() != "") mqttManager = new ClusterflyManager(constructPtrs,parser.getUserId(),parser.getMqttPassword());
 
   WiFiParams *params = new WiFiParams();
   params->ssid = parser.getSSID();
   params->password = parser.getPassword();
+
+  params->staticIpParamsMustBeInit = false;
+
+  params->staticIP = parser.getStaticIP();//IPAddress(192,168,1,52);
+  params->gateway = parser.getGateway();//IPAddress(192,168,1,1);
+  params->subnet = parser.getSubnet();//IPAddress(255,255,255,0);
+  params->primaryDNS = parser.getPrimaryDNS();//IPAddress(192,168,1,1);
+  params->secondaryDNS = parser.getSecondaryDNS();//IPAddress(0,0,0,0);
+
   xTaskCreatePinnedToCore(
     checkWiFiConnection,  // Функция задачи
     "WiFiCheckTask",      // Название задачи
@@ -156,6 +272,8 @@ void setup() {
   setupClock();
   EEPROM.get(timerAddress,stopTimerSec);
   EEPROM.get(temperatureAddress,temperatureThreshold);
+  EEPROM.get(maxFlowAddress, maxLitersPerMinute);
+  EEPROM.get(ignoreCountAddress, ignoreAfterTurningOn);
   readIntervalsFromEEPROM();
 
   Serial.print("Время остановки таймера: ");
@@ -174,11 +292,23 @@ void setup() {
                   Adafruit_BMP280::FILTER_X16,      /* Filtering. */
                   Adafruit_BMP280::STANDBY_MS_1000); /* Standby time. */
   }
+
+
+  Serial.print("Свободная память: ");
+  Serial.println(ESP.getFreeHeap());
+  if(telegramManager != nullptr) xTaskCreatePinnedToCore(botTask, "Task1", 8192, NULL, 1, NULL, tskNO_AFFINITY);
+  if(mqttManager != nullptr) xTaskCreatePinnedToCore(mqttTask, "Task2", 8192, NULL, 1, NULL, tskNO_AFFINITY);
+  //if(localManager != nullptr) xTaskCreatePinnedToCore(localServTask, "Task3", 65536, NULL, 1, NULL, tskNO_AFFINITY); //закоментил тк использую Async библеотеку
 }
-void loop() {
-  // put your main code here, to run repeatedly:
-  if (WiFi.status() == WL_CONNECTED){
-    if(isFirstInternetRequest && bot != nullptr){
+
+
+void botTask(void *pvParameters) {
+
+  bool isFirstInternetRequest = true;
+
+  while (true) {
+
+    if (isFirstInternetRequest && WiFi.status() == WL_CONNECTED){
       Serial.println("Попытка сделать первый запрос");
       if(bot->sendMessage(chatId, "кран перезагружен")){
         Serial.println("Первый запрос успешен");
@@ -186,45 +316,135 @@ void loop() {
         bot->getUpdates(-1);
       }
     }
-  }
-  if (WiFi.status() == WL_CONNECTED) {
+
+
     ChangePtrs changePtrs;
-    changePtrs.intervals = &intervals;
-    changePtrs.stopTimerSec = &stopTimerSec;
-    changePtrs.temperatureThreshold = &temperatureThreshold;
 
-    int oldIntervalsSize = intervals.size();
-    uint32_t oldTimer = stopTimerSec;
-    float oldThreshold = temperatureThreshold;
+    if (xSemaphoreTake(mutex, portMAX_DELAY)) {
+      changePtrs.intervals = &intervals;
+      changePtrs.stopTimerSec = &stopTimerSec;
+      changePtrs.temperatureThreshold = &temperatureThreshold;
+      changePtrs.ignoreAfterTurningOn = &ignoreAfterTurningOn;
+      changePtrs.maxLitersPerMinute = &maxLitersPerMinute;
+      changePtrs.flowExceededMaxValue = &flowExceededMaxValue;
 
-    if(localManager != nullptr) localManager->tickServer(changePtrs);
-    if(telegramManager != nullptr) telegramManager->tickBot(changePtrs);
-    if(mqttManager != nullptr) mqttManager->tickMqtt(changePtrs);
+      changePtrs.mutex = mutex;
 
-    if(oldIntervalsSize != intervals.size()) {
-      saveIntervalsToEEPROM();
+      xSemaphoreGive(mutex);
     }
-    if(oldTimer != stopTimerSec){
-      EEPROM.put(timerAddress,stopTimerSec);
-      EEPROM.commit();
-    }
-    if(oldThreshold != temperatureThreshold){
-      EEPROM.put(temperatureAddress,temperatureThreshold);
-      EEPROM.commit();
-    }
-    /*
-    if (millis() - lastTimeBotRan > (dialog.inProcess() ? inputModeBotRequestDelay : baseBotRequestDelay)) {
-      int messageCount = bot->getUpdates(-1);
-      if (messageCount > 0) {
-        handleMessage(messageCount - 1);
-      }
-
-      lastTimeBotRan = millis();
-    }
-    */
+    if (WiFi.status() == WL_CONNECTED) telegramManager->tickBot(changePtrs); // Может быть долгим
 
 
+    vTaskDelay(pdMS_TO_TICKS(1000));  // Ожидание в миллисекундах
   }
+
+}
+
+void mqttTask(void *pvParameters) {
+
+  while (true) {
+    ChangePtrs changePtrs;
+
+    if (xSemaphoreTake(mutex, portMAX_DELAY)) {
+      changePtrs.intervals = &intervals;
+      changePtrs.stopTimerSec = &stopTimerSec;
+      changePtrs.temperatureThreshold = &temperatureThreshold;
+      changePtrs.ignoreAfterTurningOn = &ignoreAfterTurningOn;
+      changePtrs.maxLitersPerMinute = &maxLitersPerMinute;
+      changePtrs.flowExceededMaxValue = &flowExceededMaxValue;
+      changePtrs.mutex = mutex;
+
+      xSemaphoreGive(mutex);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) mqttManager->tickMqtt(changePtrs); // Может быть долгим
+
+    vTaskDelay(pdMS_TO_TICKS(1000));  // Ожидание в миллисекундах
+  }
+
+}
+
+/*
+void localServTask(void *pvParameters) {
+
+  while (true) {
+    ChangePtrs changePtrs;
+
+    if (xSemaphoreTake(mutex, portMAX_DELAY)) {
+      changePtrs.intervals = &intervals;
+      changePtrs.stopTimerSec = &stopTimerSec;
+      changePtrs.temperatureThreshold = &temperatureThreshold;
+      changePtrs.mutex = mutex;
+
+      xSemaphoreGive(mutex);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) localManager->tickServer(changePtrs); // Может быть долгим
+
+
+    vTaskDelay(pdMS_TO_TICKS(300));  // Ожидание в миллисекундах
+  }
+}
+*/
+
+int oldIntervalsSize;
+uint32_t oldTimer;
+float oldThreshold;
+uint8_t oldIgnoreAfterTurningOn;
+float oldMaxLitersPerMinute;
+bool isFirstIter = true;
+
+void loop() {
+  // put your main code here, to run repeatedly:
+  xSemaphoreTake(mutex, portMAX_DELAY);
+
+  if(isFirstIter){
+    oldIntervalsSize = intervals.size();
+    oldTimer = stopTimerSec;
+    oldThreshold = temperatureThreshold;
+    oldMaxLitersPerMinute = maxLitersPerMinute;
+    oldIgnoreAfterTurningOn = ignoreAfterTurningOn;
+    isFirstIter = false;
+  }
+
+  if(oldIntervalsSize != intervals.size()) {
+    saveIntervalsToEEPROM();
+  }
+  if(oldTimer != stopTimerSec){
+    EEPROM.put(timerAddress,stopTimerSec);
+    EEPROM.commit();
+  }
+  if(oldThreshold != temperatureThreshold){
+    EEPROM.put(temperatureAddress,temperatureThreshold);
+    EEPROM.commit();
+  }
+  if(oldIgnoreAfterTurningOn != ignoreAfterTurningOn){
+    EEPROM.put(ignoreCountAddress,ignoreAfterTurningOn); //
+    EEPROM.commit();
+  }
+  if(oldMaxLitersPerMinute != maxLitersPerMinute){
+    EEPROM.put(maxFlowAddress,maxLitersPerMinute); //
+    EEPROM.commit();
+  }
+  xSemaphoreGive(mutex);
+
+
+  if(wifiParamsMustBeSaved){
+    SettingsParser parser(parserAddress,true);
+
+    parser.updateIPConfig(updatedWiFiParams.staticIP,
+                          updatedWiFiParams.gateway,
+                          updatedWiFiParams.subnet,
+                          updatedWiFiParams.primaryDNS,
+                          updatedWiFiParams.secondaryDNS);
+
+    wifiParamsMustBeSaved = false;
+  }
+
+
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  xSemaphoreTake(rtcMutex, portMAX_DELAY);
+  xSemaphoreTake(bmpMutex, portMAX_DELAY);
 
   RtcDateTime now = Rtc.GetDateTime();
   bool isTimerActive = now.TotalSeconds() < stopTimerSec;
@@ -237,17 +457,32 @@ void loop() {
     }
   }
 
-  if(isTimerActive || isInInterval || isTempThreshold){
-    if(!relayStatus){
-      relayStatus = true;
-      digitalWrite(relayPin1,relayStatus);
-    }
+  if(millis() - lastFlowUpdate >= 60 * 1000){
+
+    int currentPulseCount;
+    portENTER_CRITICAL(&pulseCountMux);
+    currentPulseCount = pulseCount;
+    pulseCount = 0;
+    portEXIT_CRITICAL(&pulseCountMux);
+    lastFlowUpdate = millis();
+
+    if(relayStatus) flowUpdatesAfterTurningOn++;
+    else flowUpdatesAfterTurningOn = 0;
+
+    lastLitersPerMinute = currentPulseCount / pulsesPerLiter;
+
+    if(flowUpdatesAfterTurningOn > ignoreAfterTurningOn && lastLitersPerMinute > maxLitersPerMinute)
+      flowExceededMaxValue = true;
+    
+  }
+
+  
+
+  if(!flowExceededMaxValue && (isTimerActive || isInInterval || isTempThreshold)){
+    turnOnRelay();
   }
   else{
-    if(relayStatus){
-      relayStatus = false;
-      digitalWrite(relayPin1,relayStatus);
-    }
+    turnOffRelay();
   }
 
   if(!isTimerActive && stopTimerSec != 0){
@@ -255,7 +490,26 @@ void loop() {
     EEPROM.put(timerAddress,stopTimerSec);
     EEPROM.commit();
   }
-  vTaskDelay(1000 / portTICK_PERIOD_MS); //секунда
+
+  xSemaphoreGive(mutex);
+  xSemaphoreGive(rtcMutex);
+  xSemaphoreGive(bmpMutex);
+
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+}
+
+void turnOnRelay(){
+  if(!relayStatus){
+    relayStatus = true;
+    digitalWrite(relayPin,relayStatus);
+  }
+}
+
+void turnOffRelay(){
+  if(relayStatus){
+    relayStatus = false;
+    digitalWrite(relayPin,relayStatus);
+  }
 }
 
 void setupFirstTimeEEPROM(){
@@ -265,6 +519,10 @@ void setupFirstTimeEEPROM(){
   }
   EEPROM.put(temperatureAddress,1000.0f);
   EEPROM.put(timerAddress,(uint32_t)0);
+
+  EEPROM.put(maxFlowAddress,0.0f);
+  EEPROM.put(ignoreCountAddress,0.0f);
+
   EEPROM.write(intervalsAddress,0);
   EEPROM.commit();
 }

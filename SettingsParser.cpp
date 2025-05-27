@@ -1,11 +1,11 @@
 #include "SettingsParser.h"
 
-SettingsParser::SettingsParser(int eepromAddress){
+SettingsParser::SettingsParser(int eepromAddress,bool writeOnly){
   this->eepromAddress = eepromAddress;
-  loadSettingsFromEEPROM();
+  if(!writeOnly) loadSettingsFromEEPROM();
 }
 
-//серверная
+//серверная+
 
 void SettingsParser::raiseServer(const String& serverName){
 
@@ -48,6 +48,13 @@ void SettingsParser::handleNewClient() {
             id чата: <input type="text" name="chatId" value=")" + chatId + R"("><br>
             User ID: <input type="text" name="userId" value=")" + userId + R"("><br>
             MQTT Пароль: <input type="password" name="mqttPassword" value=")" + mqttPassword + R"("><br>
+            <h3 style="color:black;">ручная настройка подключения(необязательно)</h3>
+
+            IP: <input type="text" name="ip" value=")" + staticIP.toString() + R"("><br>
+            SUBNET: <input type="text" name="subnet" value=")" + subnet.toString() + R"("><br>
+            GATEWAY: <input type="text" name="gateway" value=")" + gateway.toString() + R"("><br>
+            DNS0: <input type="text" name="dns0" value=")" + primaryDNS.toString() + R"("><br>
+            DNS1: <input type="text" name="dns1" value=")" + secondaryDNS.toString() + R"("><br>
             <input type="submit" value="Принять">
         </form>
     </body>
@@ -59,7 +66,13 @@ void SettingsParser::handleNewClient() {
 }
 
 void SettingsParser::handleForm(){
-  if (!server->hasArg("ssid") || !server->hasArg("password") || !server->hasArg("botToken") || !server->hasArg("chatId") || !server->hasArg("userId") || !server->hasArg("mqttPassword")){
+
+  //Dont watch pls
+  if (!server->hasArg("ssid") || !server->hasArg("password") || !server->hasArg("botToken") ||
+      !server->hasArg("chatId") || !server->hasArg("userId") || !server->hasArg("mqttPassword") ||
+      !server->hasArg("ip") || !server->hasArg("subnet") || !server->hasArg("gateway") ||
+      !server->hasArg("dns0") || !server->hasArg("dns1")
+   ){
     server->send(200, "text/html", "<h2>Ошибка сервера</h2><p>Обновите страницу</p>");
     return;
   }
@@ -69,6 +82,12 @@ void SettingsParser::handleForm(){
   String parsedChatId   = server->arg("chatId");
   String parsedUserId   = server->arg("userId");
   String parsedMqttPassword   = server->arg("mqttPassword");
+
+  String parsedStaticIP = server->arg("ip");
+  String parsedSubnet = server->arg("subnet");
+  String parsedGateway = server->arg("gateway");
+  String parsedPrimaryDNS = server->arg("dns0");
+  String parsedSecondaryDNS = server->arg("dns1");
 
   if(parsedSsid.length() > ssidSize - 2){
     server->sendHeader("Content-Type", "text/html; charset=utf-8");
@@ -128,18 +147,28 @@ void SettingsParser::handleForm(){
     server->send(200, "text/html", response);
     return;
 }
+  if (parsedMqttPassword.length() > mqttPasswordSize - 2) {
+      server->sendHeader("Content-Type", "text/html; charset=utf-8");
+      String response = "<html><head><meta charset='UTF-8'></head><body>";
+      response += "<h2>MQTT Пароль должен быть меньше чем " + String(mqttPasswordSize - 2) + "</h2>";
+      response += "<form action='/'>"; // Переход на главную страницу
+      response += "<button type='submit'>На главную</button>";
+      response += "</form>";
+      response += "</body></html>";
+      server->send(200, "text/html", response);
+      return;
+  }
 
-if (parsedMqttPassword.length() > mqttPasswordSize - 2) {
-    server->sendHeader("Content-Type", "text/html; charset=utf-8");
-    String response = "<html><head><meta charset='UTF-8'></head><body>";
-    response += "<h2>MQTT Пароль должен быть меньше чем " + String(mqttPasswordSize - 2) + "</h2>";
-    response += "<form action='/'>"; // Переход на главную страницу
-    response += "<button type='submit'>На главную</button>";
-    response += "</form>";
-    response += "</body></html>";
-    server->send(200, "text/html", response);
-    return;
-}
+  IPAddress convertedStaticIP, convertedGateway, convertedSubnet, convertedPrimaryDNS,convertedSecondaryDNS;
+  if(!convertStrToIP(parsedStaticIP,convertedStaticIP) || !convertStrToIP(parsedGateway,convertedGateway) || !convertStrToIP(parsedSubnet,convertedSubnet) ||
+     !convertStrToIP(parsedPrimaryDNS,convertedPrimaryDNS) || !convertStrToIP(parsedSecondaryDNS,convertedSecondaryDNS))
+      convertedStaticIP = convertedGateway = convertedSubnet = convertedPrimaryDNS = convertedSecondaryDNS = IPAddress(0,0,0,0);
+     
+  staticIP = convertedStaticIP;
+  gateway = convertedGateway;
+  subnet = convertedSubnet;
+  primaryDNS = convertedPrimaryDNS;
+  secondaryDNS = convertedSecondaryDNS;
 
   ssid     = parsedSsid;
   password = parsedPassword;
@@ -158,6 +187,23 @@ if (parsedMqttPassword.length() > mqttPasswordSize - 2) {
   ESP.restart();
 }
 
+void SettingsParser::updateIPConfig(IPAddress staticIP, IPAddress gateway, IPAddress subnet, IPAddress primaryDNS, IPAddress secondaryDNS){
+  int startAdd = eepromAddress + ssidSize + passwordSize + botTokenSize + chatIdSize + userIdSize + mqttPasswordSize;
+
+  writeIPToEEPROM(startAdd + IP4Size*0, staticIP);
+  writeIPToEEPROM(startAdd + IP4Size*1, gateway);
+  writeIPToEEPROM(startAdd + IP4Size*2, subnet);
+  writeIPToEEPROM(startAdd + IP4Size*3, primaryDNS);
+  writeIPToEEPROM(startAdd + IP4Size*4, secondaryDNS);
+
+  this->staticIP = staticIP;
+  this->gateway = gateway;
+  this->subnet = subnet; 
+  this->primaryDNS = primaryDNS;
+  this->secondaryDNS = secondaryDNS;
+  
+}
+
 
 //чтение из EEPROM
 
@@ -168,6 +214,15 @@ void SettingsParser::loadSettingsFromEEPROM(){
   chatId       = readStringFromEEPROM(eepromAddress + ssidSize + passwordSize + botTokenSize);
   userId       = readStringFromEEPROM(eepromAddress + ssidSize + passwordSize + botTokenSize + chatIdSize);
   mqttPassword = readStringFromEEPROM(eepromAddress + ssidSize + passwordSize + botTokenSize + chatIdSize + userIdSize);
+
+  int startAdd = eepromAddress + ssidSize + passwordSize + botTokenSize + chatIdSize + userIdSize + mqttPasswordSize;
+
+  staticIP     = readIPFromEEPROM(startAdd);
+  gateway      = readIPFromEEPROM(startAdd + IP4Size * 1);
+  subnet       = readIPFromEEPROM(startAdd + IP4Size * 2);
+  primaryDNS   = readIPFromEEPROM(startAdd + IP4Size * 3);
+  secondaryDNS = readIPFromEEPROM(startAdd + IP4Size * 4);
+
 }
 
 void SettingsParser::writeSettingsToEEPROM(){
@@ -177,6 +232,13 @@ void SettingsParser::writeSettingsToEEPROM(){
   writeStringToEEPROM(eepromAddress + ssidSize + passwordSize + botTokenSize,                           chatId);
   writeStringToEEPROM(eepromAddress + ssidSize + passwordSize + botTokenSize + chatIdSize,              userId);
   writeStringToEEPROM(eepromAddress + ssidSize + passwordSize + botTokenSize + chatIdSize + userIdSize, mqttPassword);
+
+  int startAdd = eepromAddress + ssidSize + passwordSize + botTokenSize + chatIdSize + userIdSize + mqttPasswordSize;
+  writeIPToEEPROM(startAdd + IP4Size*0, staticIP);
+  writeIPToEEPROM(startAdd + IP4Size*1, gateway);
+  writeIPToEEPROM(startAdd + IP4Size*2, subnet);
+  writeIPToEEPROM(startAdd + IP4Size*3, primaryDNS);
+  writeIPToEEPROM(startAdd + IP4Size*4, secondaryDNS);
 }
 
 void SettingsParser::writeStringToEEPROM(int eepromAddress,const String& str){
@@ -198,8 +260,27 @@ String SettingsParser::readStringFromEEPROM(int eepromAddress){
   return String(str);
 }
 
+void SettingsParser::writeIPToEEPROM(int eepromAddress,IPAddress ip){
+  EEPROM.write(eepromAddress, ip[0]);
+  EEPROM.write(eepromAddress + 1, ip[1]);
+  EEPROM.write(eepromAddress + 2, ip[2]);
+  EEPROM.write(eepromAddress + 3, ip[3]);
+
+  EEPROM.commit();
+}
+
+IPAddress SettingsParser::readIPFromEEPROM(int eepromAddress){
+  byte ip[4];
+  ip[0] = EEPROM.read(eepromAddress);
+  ip[1] = EEPROM.read(eepromAddress + 1);
+  ip[2] = EEPROM.read(eepromAddress + 2);
+  ip[3] = EEPROM.read(eepromAddress + 3);
+  
+  return IPAddress(ip[0], ip[1], ip[2], ip[3]);
+}
+
 int SettingsParser::getReservedSizeEEPROM(){
-  return ssidSize + passwordSize + botTokenSize + chatIdSize + userIdSize + mqttPasswordSize;
+  return ssidSize + passwordSize + botTokenSize + chatIdSize + userIdSize + mqttPasswordSize + IP4Size * 5;
 }
 
 //гэттеры
@@ -226,6 +307,51 @@ String SettingsParser::getMqttPassword(){
   return mqttPassword;
 }
 
+IPAddress SettingsParser::getStaticIP(){
+  return staticIP;
+}
+IPAddress SettingsParser::getGateway(){
+  return gateway;
+}
+IPAddress SettingsParser::getSubnet(){
+  return subnet;
+}
+IPAddress SettingsParser::getPrimaryDNS(){
+  return primaryDNS;
+}
+IPAddress SettingsParser::getSecondaryDNS(){
+  return secondaryDNS;
+}
+
+/*
+String SettingsParser::convertIPToStr(IPAddress ip){
+  return ip.toString();
+}
+*/
+bool SettingsParser::convertStrToIP(const String& ipStr, IPAddress& ip) {
+    int parts[4] = {0};
+    int partIndex = 0;
+    
+    size_t start = 0;
+    size_t end = ipStr.indexOf('.');
+    
+    while (end != -1 && partIndex < 4) {
+        parts[partIndex++] = ipStr.substring(start, end).toInt();
+        start = end + 1;
+        end = ipStr.indexOf('.', start);
+    }
+    
+    if (partIndex < 3) return false;
+    parts[partIndex] = ipStr.substring(start).toInt();
+    
+    for (int i = 0; i < 4; i++) {
+        if (parts[i] < 0 || parts[i] > 255) return false;
+    }
+    
+    ip = IPAddress(parts[0], parts[1], parts[2], parts[3]);
+    return true;
+}
+
 
 const int SettingsParser::ssidSize = 27;
 const int SettingsParser::passwordSize = 20;
@@ -233,4 +359,8 @@ const int SettingsParser::botTokenSize = 50;
 const int SettingsParser::chatIdSize = 20;
 const int SettingsParser::userIdSize = 20;
 const int SettingsParser::mqttPasswordSize = 20;
+
+const int SettingsParser::IP4Size = 4;
+
+
 

@@ -5,6 +5,8 @@ class ClusterflyManager{
 public:
   ClusterflyManager(const ConstructPtrs& params,String userId, String password,const uint32_t& updateDelay = 25'000);
   void tickMqtt(const ChangePtrs& params);
+
+  
 private:
   static void mqttCallback(char* topic, byte* payload, unsigned int length);
   void handleMessage(char* topic, byte* payload, unsigned int length);
@@ -15,6 +17,8 @@ private:
   void processIntervalTopic(byte* payload, unsigned int length);
   void processTimerTopic(byte* payload, unsigned int length);
   void processDeleteTopic(byte* payload, unsigned int length);
+  void processMaxFlowTopic(byte* payload, unsigned int length);
+  void processIgnoreCountTopic(byte* payload, unsigned int length);
 
   bool convertTimeToSec(const String& dateTime, uint32_t& seconds);
 
@@ -25,16 +29,36 @@ private:
 
   String userId,password;
 
-  String tempThresholdTopic = "/temp_threshold",intervalTopic = "/interval",timerTopic = "/timer",delIntervalsTopic = "/del_intervals";
-  String statusTopic = "/status",logsTopic = "/logs",tempTopic = "/temp";
+  String tempThresholdTopic = "/temp_threshold",
+  intervalTopic = "/interval",
+  timerTopic = "/timer",
+  delIntervalsTopic = "/del_intervals",
+  maxFlowTopic="/max_flow",
+  ignoreCountTopic="/ignore_count";
+
+  String statusTopic = "/status",
+  logsTopic = "/logs",
+  tempTopic = "/temp",
+  flowTopic = "/flow",
+  flowBlockTopic = "/flow_block";
 
   std::vector<IntervalTime>* intervals;
   uint32_t* stopTimerSec;
   float* temperatureThreshold;
+  float* maxLitersPerMinute;
+  uint8_t* ignoreAfterTurningOn;
+  bool* flowExceededMaxValue;
 
   const bool* relayStatus;
+  const float* lastLitersPerMinute;
+  SemaphoreHandle_t mutex;
+
   RtcDS1302<ThreeWire>* rtc;
+  SemaphoreHandle_t rtcMutex;
+
   Adafruit_BMP280* bmp;
+  SemaphoreHandle_t bmpMutex;
+
   PubSubClient* mqtt;
 
   static ClusterflyManager* instance;

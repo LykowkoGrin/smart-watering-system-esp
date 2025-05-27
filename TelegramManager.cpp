@@ -5,7 +5,11 @@ TelegramManager::TelegramManager(const ConstructPtrs& params,const uint32_t& req
   bot = params.bot;
   rtc = params.rtc;
   bmp = params.bmp;
+  bmpMutex = params.bmpMutex;
+  rtcMutex = params.rtcMutex;
+
   relayStatus = params.relayStatus;
+  lastLitersPerMinute = params.lastLitersPerMinute;
 
   this->requestDelay = requestDelay;
   this->inputRequestDelay = inputRequestDelay;
@@ -15,6 +19,8 @@ TelegramManager::TelegramManager(const ConstructPtrs& params,const uint32_t& req
 void TelegramManager::tickBot(const ChangePtrs& params){
   if(millis() - lastTimeBotRan < (stage == processStage::none ? requestDelay : inputRequestDelay)) return;
 
+  mutex = params.mutex;
+
   lastTimeBotRan = millis();
   changePtrs = params;
   handleNewMessage();
@@ -22,6 +28,7 @@ void TelegramManager::tickBot(const ChangePtrs& params){
 
 void TelegramManager::handleNewMessage(){
   messageCount = bot->getUpdates(-1);
+
   if (messageCount == 0) return;
 
   switch(stage){
@@ -43,6 +50,12 @@ void TelegramManager::handleNewMessage(){
     case(temperatureInput):
       processTemperature();
       break;
+    case(maxFlowInput):
+      processMaxFlow();
+      break;
+    case(ignoreCountInput):
+      processIgnoreCount();
+      break;
   }
 }
 
@@ -50,11 +63,20 @@ void TelegramManager::processFirstMessage(){
   String msg = bot->messages[messageCount - 1].text;
   String chatId = bot->messages[messageCount - 1].chat_id;
   if(msg == "/полив"){
-    bool isSend = bot->sendMessage(chatId, "Введите число от 1 до 4:\n1 - включить полив на некторое время\n2 - добавить интервал включения полива\n3 - установить температурный порог включения полива\n4 - убрать один из интревалов включения полива");
+    bool isSend = bot->sendMessage(chatId, 
+"Введите число от 1 до 7:\n"
+"1 - установить таймер\n"
+"2 - добавить интервал включения полива\n"
+"3 - установить температурный порог включения полива\n"
+"4 - убрать один из интервалов включения полива\n"
+"5 - установить верхнюю границу потока воды\n"
+"6 - установить количество игнорируемых измерений после включения\n"
+"7 - возобновить полив");
     if(!isSend) stage = processStage::none;
     stage = processStage::chooseInput;
   }
   else if(msg == "/статус"){
+    xSemaphoreTake(mutex, portMAX_DELAY);
     String intervalsInfo;
     for(int i = 0 ; i < (changePtrs.intervals)->size(); i ++){
       intervalsInfo += "\n" + (*changePtrs.intervals)[i].toString();
@@ -67,12 +89,28 @@ void TelegramManager::processFirstMessage(){
       intervalsInfo = "Интревалы включения не указаны";
     }
 
-    uint32_t timeToStop = *changePtrs.stopTimerSec - rtc->GetDateTime().TotalSeconds();
+    float nowTemp;
+    uint32_t nowSec;
+    if (xSemaphoreTake(bmpMutex, portMAX_DELAY)){
+      nowTemp = bmp->readTemperature();
+      xSemaphoreGive(bmpMutex);
+    }
+
+    if (xSemaphoreTake(rtcMutex, portMAX_DELAY)){
+      nowSec = rtc->GetDateTime().TotalSeconds();
+      xSemaphoreGive(rtcMutex);
+    }
+
+    uint32_t timeToStop = *changePtrs.stopTimerSec - nowSec;
     String timerInfo = *changePtrs.stopTimerSec == 0 ? "Таймер выключен" : "Остановка таймера через " + String(timeToStop / 60.f) + " минут";
     String relayInfo = *relayStatus ? "Полив включен" : "Полив выключен";
-    String temperatureInfo = "Температурный порог: " + String(*changePtrs.temperatureThreshold) + ". Актуальная температура: " + String(bmp->readTemperature());
-    
-    bot->sendMessage(chatId, intervalsInfo + "\n" + timerInfo + "\n" + temperatureInfo + "\n" + relayInfo);
+    String temperatureInfo = "Температурный порог: " + String(*changePtrs.temperatureThreshold) + ". Актуальная температура: " + String(nowTemp);
+    String flowInfo1 = "Поток л/мин: " + String(*lastLitersPerMinute);
+    String flowInfo2 = "Верхняя граница потока: " + String(*changePtrs.maxLitersPerMinute);
+    String flowInfo3 = "Количество измерений потока до принятия решения: " + String(*changePtrs.ignoreAfterTurningOn);
+    String flowInfo4 = *changePtrs.flowExceededMaxValue ? "Полив заблокирован" : "Поток НЕ заблокирован";
+    xSemaphoreGive(mutex);
+    bot->sendMessage(chatId, intervalsInfo + "\n" + timerInfo + "\n" + temperatureInfo + "\n" + relayInfo + "\n" + flowInfo1 + "\n" + flowInfo2 + "\n" + flowInfo3 + "\n" + flowInfo4);
   }
 }
 
@@ -96,40 +134,92 @@ void TelegramManager::processChoose(){
     return;
   }
 
-  if(num < 1 || num > 4){
-    bot->sendMessage(chatId,"Цифра должна быть от 1 до 4!");
+  if(num < 1 || num > 7){
+    bot->sendMessage(chatId,"Цифра должна быть от 1 до 7!");
     stage = processStage::none;
     return;
   }
 
-  switch(num){
+  switch(num) {
     case 1:
-      if(bot->sendMessage(chatId,"Введите время, на которое будет включен полив в формате: \"час:минута\". Час и минута могут быть более чем 24 и 60, но не более 256."))
+      if(bot->sendMessage(chatId, 
+          "Введите время, на которое будет включен полив в формате: \"час:минута\". "
+          "Час и минута могут быть более чем 24 и 60, но не более 256.")) {
         stage = processStage::timerInput;
-      else
+      } else {
         stage = processStage::none;
-      break;
-    case 2:
-      if(bot->sendMessage(chatId,"Введите начало и конец включения в формате: \"час:минута-час:минута\". Если начало будет больше чем конец, то выключение произоёдет через 24 часа."))
-        stage = processStage::intervalInput;
-      else 
-        stage = processStage::none;
-      break;
-    case 3:
-      if(bot->sendMessage(chatId,"Введите порог температуры. Можно использовать не целые числа."))
-        stage = processStage::temperatureInput;
-      else
-        stage = processStage::none;
-      break;
-    case 4:
-      String intervalsStr;
-      for(int i = 0 ; i < (*changePtrs.intervals).size(); i ++){
-        intervalsStr += "\n" + String(i) + ") " + (*changePtrs.intervals)[i].toString();
       }
-      if(bot->sendMessage(chatId,"Введите номер удаляемого интервала:" + intervalsStr))
-        stage = processStage::delIntervalInput;
-      else
+      break;
+
+    case 2:
+      if(bot->sendMessage(chatId,
+          "Введите начало и конец включения в формате: \"час:минута-час:минута\". "
+          "Если начало будет больше чем конец, то выключение произойдет через 24 часа.")) {  // Исправлена орфография
+        stage = processStage::intervalInput;
+      } else {
         stage = processStage::none;
+      }
+      break;
+
+    case 3:
+      if(bot->sendMessage(chatId,
+          "Введите порог температуры. Можно использовать нецелые числа.")) {
+        stage = processStage::temperatureInput;
+      } else {
+        stage = processStage::none;
+      }
+      break;
+
+    case 4: {
+      xSemaphoreTake(mutex, portMAX_DELAY);
+      String intervalsStr;
+      const size_t intervalCount = (*changePtrs.intervals).size();  // Исправлен тип
+      
+      for(size_t i = 0; i < intervalCount; i++) {  // Исправлен тип переменной
+        intervalsStr += '\n';
+        intervalsStr += i;
+        intervalsStr += ") ";
+        intervalsStr += (*changePtrs.intervals)[i].toString();
+      }
+      
+      if(bot->sendMessage(chatId, 
+          "Введите номер удаляемого интервала:" + intervalsStr)) {
+        stage = processStage::delIntervalInput;
+      } else {
+        stage = processStage::none;
+      }
+      xSemaphoreGive(mutex);
+      break;
+    }
+
+    case 5:
+      if(bot->sendMessage(chatId,
+          "Введите значение скорости потока (л/мин), при котором будет выключен кран "
+          "до перезагрузки или до соответствующего запроса.")) {
+        stage = processStage::maxFlowInput;
+      } else {
+        stage = processStage::none;
+      }
+      break;
+
+    case 6:
+      if(bot->sendMessage(chatId,
+          "Введите сколько раз будут игнорироваться значения скорости потока после включения. "
+          "Замер скорости происходит раз в минуту.")) {
+        stage = processStage::ignoreCountInput;
+      } else {
+        stage = processStage::none;
+      }
+      break;
+    case 7:
+      if(bot->sendMessage(chatId,"Полив разблокирован.")) {
+        xSemaphoreTake(mutex, portMAX_DELAY);
+        *changePtrs.flowExceededMaxValue = false;
+        xSemaphoreGive(mutex);
+      }
+      
+      stage = processStage::none;
+      
       break;
   }
 }
@@ -153,10 +243,19 @@ void TelegramManager::processTimer(){
     stage = processStage::none;
     return;
   }
-  RtcDateTime now = rtc->GetDateTime();
-  *changePtrs.stopTimerSec = now.TotalSeconds() + h * 3600 + m * 60;
-  //EEPROM.put(timerAddress,*changePtrs.stopTimerSec);
-  //EEPROM.commit();
+
+  RtcDateTime now;
+  if (xSemaphoreTake(rtcMutex, portMAX_DELAY)){
+    now = rtc->GetDateTime();
+    xSemaphoreGive(rtcMutex);
+  }
+
+  if (xSemaphoreTake(mutex, portMAX_DELAY)){
+    *changePtrs.stopTimerSec = now.TotalSeconds() + h * 3600 + m * 60;
+    xSemaphoreGive(mutex);
+  }
+
+
   stage = processStage::none;
 }
 
@@ -197,8 +296,11 @@ void TelegramManager::processInterval(){
   IntervalTime inTime;
   inTime.start = startH * 3600 + startM * 60;
   inTime.stop = stopH * 3600 + stopM * 60;
-  (changePtrs.intervals)->push_back(inTime);
-  //saveIntervalsToEEPROM();
+  if (xSemaphoreTake(mutex, portMAX_DELAY)){
+    (changePtrs.intervals)->push_back(inTime);
+    xSemaphoreGive(mutex);
+  }
+
   stage = processStage::none;
 }
 
@@ -215,19 +317,23 @@ void TelegramManager::processDelete(){
     stage = processStage::none;
     return;
   }
-
+  xSemaphoreTake(mutex, portMAX_DELAY);
   if(index < 0 || index >= (*changePtrs.intervals).size()){
     bot->sendMessage( chatId,"Число должно быть больше 0 и меньше чем " + String((*changePtrs.intervals).size()));
     stage = processStage::none;
+    xSemaphoreGive(mutex);
     return;
   }
 
   if(!bot->sendMessage( chatId, "Интревал " + (*changePtrs.intervals)[index].toString() + " будет удалён")){
     stage = processStage::none;
+    xSemaphoreGive(mutex);
     return;
   }
 
+  
   (*changePtrs.intervals).erase((changePtrs.intervals)->begin()+index);
+  xSemaphoreGive(mutex);
   stage = processStage::none;
 }
 
@@ -249,8 +355,68 @@ void TelegramManager::processTemperature(){
     stage = processStage::none;
     return;
   }
+
+  xSemaphoreTake(mutex, portMAX_DELAY);
   *changePtrs.temperatureThreshold = tempVal;
-  //EEPROM.put(temperatureAddress,temperatureThreshold);
-  //EEPROM.commit();
+  xSemaphoreGive(mutex);
+
+  stage = processStage::none;
+}
+
+void TelegramManager::processMaxFlow(){
+  String msg = bot->messages[messageCount - 1].text;
+  String chatId = bot->messages[messageCount - 1].chat_id;
+
+  msg.replace(',','.');
+  float maxFlow;
+  try{
+    maxFlow = std::stof(msg.c_str());
+  }
+  catch(std::exception ex){
+    bot->sendMessage(chatId,"Неверный формат!");
+    stage = processStage::none;
+    return;
+  }
+  if(!bot->sendMessage(chatId,"Максимальная скорость потока: " + String(maxFlow))){
+    stage = processStage::none;
+    return;
+  }
+
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  *changePtrs.maxLitersPerMinute = maxFlow;
+  xSemaphoreGive(mutex);
+
+  stage = processStage::none;
+}
+
+void TelegramManager::processIgnoreCount(){
+  String msg = bot->messages[messageCount - 1].text;
+  String chatId = bot->messages[messageCount - 1].chat_id;
+
+  int num = 0;
+  try {
+    num = std::stoi(msg.c_str());
+  }
+  catch(std::exception ex){
+    bot->sendMessage(chatId,"Неверный формат!");
+    stage = processStage::none;
+    return;
+  }
+
+  if(num < 0 || num >= 255){
+    bot->sendMessage(chatId,"Значение должно быть положительным и меньше 256");
+    stage = processStage::none;
+    return;
+  }
+
+  if(!bot->sendMessage(chatId,"Количество игнорирований: " + String(num))){
+    stage = processStage::none;
+    return;
+  }
+
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  *changePtrs.ignoreAfterTurningOn = num;
+  xSemaphoreGive(mutex);
+
   stage = processStage::none;
 }
