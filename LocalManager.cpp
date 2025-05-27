@@ -3,6 +3,7 @@
 LocalManager::LocalManager(const ConstructPtrs& params){
   this->rtc = params.rtc;
   this->relayStatus = params.relayStatus;
+  this->lastLitersPerMinute = params.lastLitersPerMinute;
   this->bmp = params.bmp;
   this->bmpMutex = params.bmpMutex;
   this->rtcMutex = params.rtcMutex;
@@ -38,6 +39,10 @@ void LocalManager::raiseServer(const String& serverName){
         handleDeleteItem(request);
     });
 
+    server->on("/reset_flow", HTTP_POST, [this](AsyncWebServerRequest *request) {
+    handleResetFlow(request);
+    });
+
     server->begin();
 
     if (!MDNS.begin(serverName.c_str())) {
@@ -49,7 +54,6 @@ void LocalManager::raiseServer(const String& serverName){
 }
 
 void LocalManager::handleNewClient(AsyncWebServerRequest *request) {
-
   uint32_t nowSec;
   float nowTemp;
 
@@ -70,12 +74,19 @@ void LocalManager::handleNewClient(AsyncWebServerRequest *request) {
   String html = "<html><head><meta charset='UTF-8'></head><body>";
   
   html += (*relayStatus == true) ? "<h2><b>Полив включен</b></h2>" : "<h2><b>Полив выключен</b></h2>";
-  html += "<h2><b>Температура:" + String(nowTemp) + "</b></h2>";
+  html += "<h2><b>Температура: " + String(nowTemp) + " °C</b></h2>";
+  html += "<h2><b>Текущий расход: " + String(*lastLitersPerMinute) + " л/мин</b></h2>";
+  html += "<h2><b>Превышение расхода: " + String(*flowExceededMaxValue ? "ДА" : "НЕТ") + "</b></h2>";
+  html += "<form action='/reset_flow' method='POST'>";
+  html += "<input type='submit' value='Сбросить превышение'>";
+  html += "</form>";
   
   html += "<h2>Настройки</h2>";
   html += "<form action='/submit' method='POST'>";
+  html += "Макс. расход (л/мин): <input type='text' name='max_liters' value='" + String(*maxLitersPerMinute) + "'><br>";
+  html += "Игнорировать показания после включения (раз): <input type='text' name='ignore_after_on' value='" + String(*ignoreAfterTurningOn) + "'><br>";
   html += "Минуты до остановки таймера: <input type='text' name='timer_end' value='" + stopTimerValue + "'><br>";
-  html += "Температурный порог(пример 30.1): <input type='text' name='temperature_threshold' value='" + String(*temperatureThreshold) + "'><br>";
+  html += "Температурный порог (°C): <input type='text' name='temperature_threshold' value='" + String(*temperatureThreshold) + "'><br>";
   html += "<input type='submit' value='Сохранить'>";
   html += "</form><br>";
 
@@ -107,6 +118,36 @@ void LocalManager::handleNewClient(AsyncWebServerRequest *request) {
 }
 
 void LocalManager::handleSubmit(AsyncWebServerRequest *request){
+
+  if (request->hasArg("max_liters")) {
+    String maxStr = request->arg("max_liters");
+    try {
+      float parsedMax = std::stof(maxStr.c_str());
+      xSemaphoreTake(mutex, portMAX_DELAY);
+      *maxLitersPerMinute = parsedMax;
+      xSemaphoreGive(mutex);
+    } 
+    catch(std::exception& ex) {
+      handleError(request, "Неверный формат максимального расхода");
+      return;
+    }
+  }
+
+  // Обработка ignore_after_on
+  if (request->hasArg("ignore_after_on")) {
+    String ignoreStr = request->arg("ignore_after_on");
+    try {
+      int parsedIgnore = std::stoi(ignoreStr.c_str());
+      xSemaphoreTake(mutex, portMAX_DELAY);
+      *ignoreAfterTurningOn = parsedIgnore;
+      xSemaphoreGive(mutex);
+    } 
+    catch(std::exception& ex) {
+      handleError(request, "Неверный формат времени игнорирования");
+      return;
+    }
+  }
+
   if (request->hasArg("timer_end")) {
     String minStr = request->arg("timer_end");
     int parsedMin;
@@ -163,6 +204,17 @@ void LocalManager::handleSubmit(AsyncWebServerRequest *request){
   AsyncWebServerResponse *response = request->beginResponse(303);  // Код 303 (See Other)
   response->addHeader("Location", "/");  // Заголовок для редиректа
   request->send(response);
+}
+
+void LocalManager::handleError(AsyncWebServerRequest *request, const String& message) {
+  String response = "<html><head><meta charset='UTF-8'></head><body>";
+  response += "<h2>" + message + "</h2>";
+  response += "<form action='/'><button type='submit'>На главную</button></form>";
+  response += "</body></html>";
+  
+  AsyncWebServerResponse *responseWeb = request->beginResponse(200, "text/plain", response);
+  responseWeb->addHeader("Content-Type", "text/html; charset=utf-8");
+  request->send(responseWeb);
 }
 
 void LocalManager::handleAddItem(AsyncWebServerRequest *request) {
@@ -248,6 +300,17 @@ void LocalManager::handleDeleteItem(AsyncWebServerRequest *request) {
     request->send(response);
 }
 
+void LocalManager::handleResetFlow(AsyncWebServerRequest *request) {
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    *flowExceededMaxValue = false; // Сбрасываем флаг
+    xSemaphoreGive(mutex);
+    
+    // Редирект обратно на главную
+    AsyncWebServerResponse *response = request->beginResponse(303);
+    response->addHeader("Location", "/");
+    request->send(response);
+}
+
 /*
 void LocalManager::tickServer(const ChangePtrs& params){
   this->intervals = params.intervals;
@@ -266,6 +329,9 @@ void LocalManager::setChangePtrs(const ChangePtrs& params){
   this->intervals = params.intervals;
   this->stopTimerSec = params.stopTimerSec;
   this->temperatureThreshold = params.temperatureThreshold;
+  this->maxLitersPerMinute = params.maxLitersPerMinute;
+  this->ignoreAfterTurningOn = params.ignoreAfterTurningOn;
+  this->flowExceededMaxValue = params.flowExceededMaxValue;
   this->mutex = params.mutex;
 }
 

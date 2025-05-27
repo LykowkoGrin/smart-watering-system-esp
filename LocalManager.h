@@ -13,9 +13,15 @@ public:
   void setChangePtrs(const ChangePtrs& params);
 private:
   std::vector<IntervalTime>* intervals;
+
   uint32_t* stopTimerSec;
   float* temperatureThreshold;
+  float* maxLitersPerMinute;
+  uint8_t* ignoreAfterTurningOn;
+  bool* flowExceededMaxValue;
+
   const bool* relayStatus;
+  const float* lastLitersPerMinute;
   SemaphoreHandle_t mutex;
 
   RtcDS1302<ThreeWire>* rtc;
@@ -30,6 +36,9 @@ private:
   void handleSubmit(AsyncWebServerRequest *request);
   void handleAddItem(AsyncWebServerRequest *request);
   void handleDeleteItem(AsyncWebServerRequest *request);
+  void handleResetFlow(AsyncWebServerRequest *request);
+
+  void handleError(AsyncWebServerRequest *request, const String& message);
 };
 
 
