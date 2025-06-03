@@ -27,6 +27,7 @@ ClusterflyManager::ClusterflyManager(const ConstructPtrs& params,String userId,S
   ignoreCountTopic = userIdForm + ignoreCountTopic;
   flowTopic = userIdForm + flowTopic;
   flowBlockTopic = userIdForm + flowBlockTopic;
+  unblockFlowTopic = userIdForm + unblockFlowTopic;
 
   mqtt->setServer("srv2.clusterfly.ru", 9992);
 }
@@ -67,6 +68,7 @@ void ClusterflyManager::handleMessage(char* topic, byte* payload, unsigned int l
   else if(strTopic == delIntervalsTopic) processDeleteTopic(payload, length);
   else if(strTopic == maxFlowTopic) processMaxFlowTopic(payload, length);
   else if(strTopic == ignoreCountTopic) processIgnoreCountTopic(payload, length);
+  else if(strTopic == unblockFlowTopic) processUnblockFlow(payload, length);
 }
 
 void ClusterflyManager::connectToMqtt(){
@@ -79,6 +81,7 @@ void ClusterflyManager::connectToMqtt(){
 
   mqtt->subscribe(maxFlowTopic.c_str());
   mqtt->subscribe(ignoreCountTopic.c_str());
+  mqtt->subscribe(unblockFlowTopic.c_str());
 
   instance = this;
   mqtt->setCallback(mqttCallback);
@@ -132,6 +135,19 @@ void ClusterflyManager::processDeleteTopic(byte* payload, unsigned int length){
 
     xSemaphoreTake(mutex, portMAX_DELAY);
     intervals->clear();
+    xSemaphoreGive(mutex);
+
+    lastRequestTime = millis();
+  }
+}
+
+void ClusterflyManager::processUnblockFlow(byte* payload, unsigned int length){
+  if(millis() - lastRequestTime < minRequestDelay) vTaskDelay(minRequestDelay / portTICK_PERIOD_MS);
+
+  if(mqtt->publish(logsTopic.c_str(),"Поток разблокирован")){
+
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    *flowExceededMaxValue = false;
     xSemaphoreGive(mutex);
 
     lastRequestTime = millis();

@@ -194,10 +194,10 @@ void checkWiFiConnection(void * parameter) {
 void setup() {
   // put your setup code here, to run once:
   pinMode(relayPin,OUTPUT);
-  pinMode(parsePin,INPUT);
+  pinMode(parsePin,INPUT_PULLUP);
   pinMode(flowPin, INPUT_PULLUP);
   digitalWrite(relayPin,relayStatus); //удалишь - убью
-  isParseSettingsMode = digitalRead(parsePin);
+  isParseSettingsMode = digitalRead(parsePin) == LOW;
   
   lastFlowUpdate = millis();
   // Настройка прерывания на спад сигнала
@@ -473,6 +473,7 @@ void loop() {
 
     if(flowUpdatesAfterTurningOn > ignoreAfterTurningOn && lastLitersPerMinute > maxLitersPerMinute)
       flowExceededMaxValue = true;
+    else flowUpdatesAfterTurningOn = 0;
     
   }
 

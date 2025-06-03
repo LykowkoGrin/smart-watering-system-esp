@@ -19,6 +19,7 @@ private:
   void processDeleteTopic(byte* payload, unsigned int length);
   void processMaxFlowTopic(byte* payload, unsigned int length);
   void processIgnoreCountTopic(byte* payload, unsigned int length);
+  void processUnblockFlow(byte* payload, unsigned int length);
 
   bool convertTimeToSec(const String& dateTime, uint32_t& seconds);
 
@@ -34,13 +35,15 @@ private:
   timerTopic = "/timer",
   delIntervalsTopic = "/del_intervals",
   maxFlowTopic="/max_flow",
-  ignoreCountTopic="/ignore_count";
+  ignoreCountTopic="/ignore_count",
+  unblockFlowTopic = "/unblock_flow";
 
   String statusTopic = "/status",
   logsTopic = "/logs",
   tempTopic = "/temp",
   flowTopic = "/flow",
   flowBlockTopic = "/flow_block";
+
 
   std::vector<IntervalTime>* intervals;
   uint32_t* stopTimerSec;
