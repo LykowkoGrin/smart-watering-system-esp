@@ -24,7 +24,7 @@ Cкетч компилируется примерно 5 минут: https://vkvi
 
 const int parsePin = 19;
 const int relayPin = 4;
-const int flowPin = 2;
+const int flowPin = 13;
 
 const int keyAddress = 0;
 const int parserAddress = keyAddress + sizeof(uint8_t);
@@ -37,7 +37,7 @@ const int intervalsAddress = ignoreCountAddress + sizeof(uint8_t);
 const int eepromSize = intervalsAddress + 150;
 
 const uint8_t eepromKey = 137;
-const float pulsesPerLiter = 300.0f;
+const float pulsesPerLiter = 450.0f;
 
 const int CLOCK_DAT = 23; // DATA (IO)
 const int CLOCK_CLK = 18; // CLOCK
@@ -473,7 +473,6 @@ void loop() {
 
     if(flowUpdatesAfterTurningOn > ignoreAfterTurningOn && lastLitersPerMinute > maxLitersPerMinute)
       flowExceededMaxValue = true;
-    else flowUpdatesAfterTurningOn = 0;
     
   }
 
