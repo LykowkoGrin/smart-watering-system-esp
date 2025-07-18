@@ -23,6 +23,8 @@ private:
 
   bool convertTimeToSec(const String& dateTime, uint32_t& seconds);
 
+  void updateLastUpdateTime();
+
   unsigned long lastRequestTime = 0;
   unsigned long lastUpdateTime = 0;
   const unsigned long minRequestDelay = 1500;
@@ -51,6 +53,7 @@ private:
   float* maxLitersPerMinute;
   uint8_t* ignoreAfterTurningOn;
   bool* flowExceededMaxValue;
+  RtcDateTime* lastDataUpdate;
 
   const bool* relayStatus;
   const float* lastLitersPerMinute;

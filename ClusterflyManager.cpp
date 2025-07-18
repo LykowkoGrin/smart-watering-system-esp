@@ -39,6 +39,7 @@ void ClusterflyManager::tickMqtt(const ChangePtrs& params){
   maxLitersPerMinute = params.maxLitersPerMinute;
   ignoreAfterTurningOn = params.ignoreAfterTurningOn;
   flowExceededMaxValue = params.flowExceededMaxValue;
+  lastDataUpdate = params.lastDataUpdate;
   mutex = params.mutex;
   
   if(!mqtt->connected()) connectToMqtt();
@@ -120,6 +121,7 @@ void ClusterflyManager::processTempTopic(byte* payload, unsigned int length){
       xSemaphoreTake(mutex, portMAX_DELAY);
       *temperatureThreshold = t;
       xSemaphoreGive(mutex);
+      updateLastUpdateTime();
     }
   }
   catch(std::exception ex){
@@ -136,6 +138,7 @@ void ClusterflyManager::processDeleteTopic(byte* payload, unsigned int length){
     xSemaphoreTake(mutex, portMAX_DELAY);
     intervals->clear();
     xSemaphoreGive(mutex);
+    updateLastUpdateTime();
 
     lastRequestTime = millis();
   }
@@ -149,6 +152,7 @@ void ClusterflyManager::processUnblockFlow(byte* payload, unsigned int length){
     xSemaphoreTake(mutex, portMAX_DELAY);
     *flowExceededMaxValue = false;
     xSemaphoreGive(mutex);
+    updateLastUpdateTime();
 
     lastRequestTime = millis();
   }
@@ -183,6 +187,7 @@ void ClusterflyManager::processIntervalTopic(byte* payload, unsigned int length)
     xSemaphoreTake(mutex, portMAX_DELAY);
     intervals->push_back(inTime);
     xSemaphoreGive(mutex);
+    updateLastUpdateTime();
 
     lastRequestTime = millis();
   }
@@ -210,6 +215,8 @@ void ClusterflyManager::processTimerTopic(byte* payload, unsigned int length){
     xSemaphoreTake(mutex, portMAX_DELAY);
     *stopTimerSec = sec;
     xSemaphoreGive(mutex);
+
+    updateLastUpdateTime();
     lastRequestTime = millis();
   }
 }
@@ -225,6 +232,8 @@ void ClusterflyManager::processMaxFlowTopic(byte* payload, unsigned int length){
       xSemaphoreTake(mutex, portMAX_DELAY);
       *maxLitersPerMinute = t;
       xSemaphoreGive(mutex);
+
+      updateLastUpdateTime();
     }
   }
   catch(std::exception ex){
@@ -243,6 +252,8 @@ void ClusterflyManager::processIgnoreCountTopic(byte* payload, unsigned int leng
       xSemaphoreTake(mutex, portMAX_DELAY);
       *ignoreAfterTurningOn = t;
       xSemaphoreGive(mutex);
+
+      updateLastUpdateTime();
     }
   }
   catch(std::exception ex){
@@ -281,6 +292,14 @@ bool ClusterflyManager::convertTimeToSec(const String& dateTime, uint32_t& secon
 
     seconds = makeTime(tm);  // makeTime возвращает секунды с 1 января 2000 года
     return true;
+}
+
+void ClusterflyManager::updateLastUpdateTime(){
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  xSemaphoreTake(rtcMutex, portMAX_DELAY);
+  *lastDataUpdate = rtc->GetDateTime();
+  xSemaphoreGive(mutex);
+  xSemaphoreGive(rtcMutex);
 }
 
 

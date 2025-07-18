@@ -18,6 +18,8 @@ private:
   void processIgnoreCount (); //
   void processMaxFlow     (); //
 
+  void updateLastUpdateTime();
+
   enum processStage{
     none,
     timerInput,
@@ -48,6 +50,7 @@ private:
 
   const bool* relayStatus;
   const float* lastLitersPerMinute;
+  RtcDateTime* lastDataUpdate;
 
   ChangePtrs changePtrs;
 };

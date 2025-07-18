@@ -23,12 +23,17 @@ struct ConstructPtrs{
 
 };
 struct ChangePtrs{
+  RtcDateTime* lastDataUpdate;//время обновления данных
+  RtcDateTime* lastHumidityUpdate;//время обновления влажности
+
   std::vector<IntervalTime>* intervals;
   uint32_t* stopTimerSec;
   float* temperatureThreshold;
   float* maxLitersPerMinute;
   uint8_t* ignoreAfterTurningOn;
   bool* flowExceededMaxValue;
+
+  int* humidity;
 
   SemaphoreHandle_t mutex;
 };

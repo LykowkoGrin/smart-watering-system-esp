@@ -33,10 +33,15 @@ const int temperatureAddress = timerAddress + sizeof(uint32_t);
 const int maxFlowAddress = temperatureAddress + sizeof(float);
 const int ignoreCountAddress = maxFlowAddress + sizeof(float);
 
-const int intervalsAddress = ignoreCountAddress + sizeof(uint8_t);
+const int flowExceededMaxValueAddress = ignoreCountAddress + sizeof(uint8_t); //
+const int humidityAddress = flowExceededMaxValueAddress + sizeof(bool); //
+const int lastDataUpdateAddress = humidityAddress + sizeof(int); //
+const int lastHumidityUpdateAddress = lastDataUpdateAddress + sizeof(uint32_t); //
+
+const int intervalsAddress = lastHumidityUpdateAddress + sizeof(uint32_t);
 const int eepromSize = intervalsAddress + 150;
 
-const uint8_t eepromKey = 137;
+const uint8_t eepromKey = 42;
 const float pulsesPerLiter = 450.0f;
 
 const int CLOCK_DAT = 23; // DATA (IO)
@@ -89,7 +94,12 @@ float lastLitersPerMinute = 0.0f;
 float maxLitersPerMinute = 0.0f;
 uint8_t ignoreAfterTurningOn = 0;
 bool flowExceededMaxValue = false; //больше ничего и не надо будет. Не заюудь за ночь
+int humidity;
+RtcDateTime lastDataUpdate;//время обновления данных
+RtcDateTime lastHumidityUpdate;//время обновления влажности
 SemaphoreHandle_t mutex = xSemaphoreCreateMutex(); //это на строчки выше тема. Вотч демо вотч демо ww
+
+ChangePtrs changePtrs;
 
 uint32_t flowUpdatesAfterTurningOn = 0; //Счетчик количества измерений после включения
 unsigned long lastFlowUpdate = 0;
@@ -126,6 +136,8 @@ void checkWiFiConnection(void * parameter) {
 
   WiFiParams *params = (WiFiParams *) parameter;
   const uint8_t maxReconnectAttempts = 15;
+  const uint32_t maxNoWiFiTime = 5 * 60 * 1000;
+  uint32_t lastConnTime = millis();
   bool isFirstConnect = true;
 
   bool staticConnIsInited = (params->staticIP != IPAddress(0,0,0,0));
@@ -149,7 +161,11 @@ void checkWiFiConnection(void * parameter) {
     if (WiFi.status() != WL_CONNECTED) {
       uint8_t reconnectAttempts = 0;
 
-
+      xSemaphoreTake(mutex, portMAX_DELAY);
+      if((maxNoWiFiTime > millis() - lastConnTime) && (lastLitersPerMinute > maxLitersPerMinute)){
+        ESP.restart();
+      }
+      xSemaphoreGive(mutex);
 
       WiFi.begin(params->ssid, params->password);
 
@@ -162,6 +178,7 @@ void checkWiFiConnection(void * parameter) {
       }
       Serial.println();
       if (WiFi.status() == WL_CONNECTED) {
+        lastConnTime = millis();
         Serial.println("Подключено к Wi-Fi");
         client.setInsecure();
         client2.setInsecure();
@@ -215,6 +232,20 @@ void setup() {
     parser.raiseServer("smartgate");
     while(true) parser.tickServer();
   }
+
+  changePtrs.intervals = &intervals;
+  changePtrs.stopTimerSec = &stopTimerSec;
+  changePtrs.temperatureThreshold = &temperatureThreshold;
+  changePtrs.ignoreAfterTurningOn = &ignoreAfterTurningOn;
+  changePtrs.maxLitersPerMinute = &maxLitersPerMinute;
+  changePtrs.flowExceededMaxValue = &flowExceededMaxValue;
+  changePtrs.lastDataUpdate = &lastDataUpdate;
+  changePtrs.lastHumidityUpdate = &lastHumidityUpdate;
+  changePtrs.humidity = &humidity;
+  changePtrs.mutex = mutex;
+
+
+
   chatId = parser.getChatId();
 
   if(parser.getBotToken() != "") bot = new UniversalTelegramBot(parser.getBotToken(), client);
@@ -230,15 +261,7 @@ void setup() {
   constructPtrs.rtcMutex = rtcMutex;
 
   localManager = new LocalManager(constructPtrs);
-  ChangePtrs chPtrs;
-  chPtrs.intervals = &intervals;
-  chPtrs.stopTimerSec = &stopTimerSec;
-  chPtrs.temperatureThreshold = &temperatureThreshold;
-  chPtrs.ignoreAfterTurningOn = &ignoreAfterTurningOn;
-  chPtrs.maxLitersPerMinute = &maxLitersPerMinute;
-  chPtrs.flowExceededMaxValue = &flowExceededMaxValue;
-  chPtrs.mutex = mutex;
-  localManager->setChangePtrs(chPtrs);
+  localManager->setChangePtrs(changePtrs);
 
   if(bot != nullptr) telegramManager = new TelegramManager(constructPtrs,10'000,10'000);
   if(parser.getUserId() != "" && parser.getMqttPassword() != "") mqttManager = new ClusterflyManager(constructPtrs,parser.getUserId(),parser.getMqttPassword());
@@ -274,6 +297,16 @@ void setup() {
   EEPROM.get(temperatureAddress,temperatureThreshold);
   EEPROM.get(maxFlowAddress, maxLitersPerMinute);
   EEPROM.get(ignoreCountAddress, ignoreAfterTurningOn);
+
+  uint32_t lastDataUpdateUINT,lastHumidityUpdateUINT;
+  EEPROM.get(flowExceededMaxValueAddress, flowExceededMaxValue);
+  EEPROM.get(humidityAddress, humidity);
+  EEPROM.get(lastDataUpdateAddress, lastDataUpdateUINT);
+  EEPROM.get(lastHumidityUpdateAddress, lastHumidityUpdateUINT);
+
+  lastDataUpdate = RtcDateTime(lastDataUpdateUINT);
+  lastHumidityUpdate = RtcDateTime(lastHumidityUpdateUINT);
+
   readIntervalsFromEEPROM();
 
   Serial.print("Время остановки таймера: ");
@@ -317,21 +350,6 @@ void botTask(void *pvParameters) {
       }
     }
 
-
-    ChangePtrs changePtrs;
-
-    if (xSemaphoreTake(mutex, portMAX_DELAY)) {
-      changePtrs.intervals = &intervals;
-      changePtrs.stopTimerSec = &stopTimerSec;
-      changePtrs.temperatureThreshold = &temperatureThreshold;
-      changePtrs.ignoreAfterTurningOn = &ignoreAfterTurningOn;
-      changePtrs.maxLitersPerMinute = &maxLitersPerMinute;
-      changePtrs.flowExceededMaxValue = &flowExceededMaxValue;
-
-      changePtrs.mutex = mutex;
-
-      xSemaphoreGive(mutex);
-    }
     if (WiFi.status() == WL_CONNECTED) telegramManager->tickBot(changePtrs); // Может быть долгим
 
 
@@ -343,19 +361,6 @@ void botTask(void *pvParameters) {
 void mqttTask(void *pvParameters) {
 
   while (true) {
-    ChangePtrs changePtrs;
-
-    if (xSemaphoreTake(mutex, portMAX_DELAY)) {
-      changePtrs.intervals = &intervals;
-      changePtrs.stopTimerSec = &stopTimerSec;
-      changePtrs.temperatureThreshold = &temperatureThreshold;
-      changePtrs.ignoreAfterTurningOn = &ignoreAfterTurningOn;
-      changePtrs.maxLitersPerMinute = &maxLitersPerMinute;
-      changePtrs.flowExceededMaxValue = &flowExceededMaxValue;
-      changePtrs.mutex = mutex;
-
-      xSemaphoreGive(mutex);
-    }
 
     if (WiFi.status() == WL_CONNECTED) mqttManager->tickMqtt(changePtrs); // Может быть долгим
 
@@ -387,6 +392,7 @@ void localServTask(void *pvParameters) {
 }
 */
 
+/*
 int oldIntervalsSize;
 uint32_t oldTimer;
 float oldThreshold;
@@ -394,19 +400,26 @@ uint8_t oldIgnoreAfterTurningOn;
 float oldMaxLitersPerMinute;
 bool isFirstIter = true;
 
+
+*/
+bool isFirstIter = true;
+RtcDateTime oldLastDataUpdate;//время обновления данных
+RtcDateTime oldLastHumidityUpdate;//время обновления влажности
 void loop() {
   // put your main code here, to run repeatedly:
   xSemaphoreTake(mutex, portMAX_DELAY);
-
+  
   if(isFirstIter){
-    oldIntervalsSize = intervals.size();
-    oldTimer = stopTimerSec;
-    oldThreshold = temperatureThreshold;
-    oldMaxLitersPerMinute = maxLitersPerMinute;
-    oldIgnoreAfterTurningOn = ignoreAfterTurningOn;
+    //oldIntervalsSize = intervals.size();
+    //oldTimer = stopTimerSec;
+    //oldThreshold = temperatureThreshold;
+    //oldMaxLitersPerMinute = maxLitersPerMinute;
+    //oldIgnoreAfterTurningOn = ignoreAfterTurningOn;
+    oldLastDataUpdate = lastDataUpdate;
+    oldLastHumidityUpdate = lastHumidityUpdate;
     isFirstIter = false;
   }
-
+  /*
   if(oldIntervalsSize != intervals.size()) {
     saveIntervalsToEEPROM();
   }
@@ -426,6 +439,29 @@ void loop() {
     EEPROM.put(maxFlowAddress,maxLitersPerMinute); //
     EEPROM.commit();
   }
+  */
+  if(lastDataUpdate != oldLastDataUpdate){
+    saveIntervalsToEEPROM();
+    EEPROM.put(timerAddress,stopTimerSec);
+    EEPROM.put(temperatureAddress,temperatureThreshold);
+    EEPROM.put(ignoreCountAddress,ignoreAfterTurningOn); 
+    EEPROM.put(maxFlowAddress,maxLitersPerMinute);
+
+    EEPROM.put(flowExceededMaxValueAddress,flowExceededMaxValue); 
+    EEPROM.put(humidityAddress,humidity);
+    EEPROM.put(lastDataUpdateAddress,lastDataUpdate.TotalSeconds());
+    EEPROM.put(lastHumidityUpdateAddress,lastHumidityUpdate.TotalSeconds());
+
+    EEPROM.commit();
+
+    oldLastDataUpdate = lastDataUpdate;
+    Serial.println("Данные обновлены");
+  }
+  if(lastHumidityUpdate != oldLastHumidityUpdate){
+    oldLastHumidityUpdate = lastHumidityUpdate;
+    Serial.println("Влажность обновлена");
+  }
+
   xSemaphoreGive(mutex);
 
 
@@ -471,8 +507,11 @@ void loop() {
 
     lastLitersPerMinute = currentPulseCount / pulsesPerLiter;
 
-    if(flowUpdatesAfterTurningOn > ignoreAfterTurningOn && lastLitersPerMinute > maxLitersPerMinute)
+    if(flowUpdatesAfterTurningOn > ignoreAfterTurningOn && lastLitersPerMinute > maxLitersPerMinute){
       flowExceededMaxValue = true;
+      EEPROM.put(flowExceededMaxValueAddress,flowExceededMaxValue);
+      EEPROM.commit();
+    }
     
   }
 
@@ -519,9 +558,13 @@ void setupFirstTimeEEPROM(){
   }
   EEPROM.put(temperatureAddress,1000.0f);
   EEPROM.put(timerAddress,(uint32_t)0);
-
   EEPROM.put(maxFlowAddress,0.0f);
-  EEPROM.put(ignoreCountAddress,0.0f);
+  EEPROM.put(ignoreCountAddress,(uint8_t)0);
+
+  EEPROM.put(flowExceededMaxValueAddress, false); 
+  EEPROM.put(humidityAddress, (int)0);
+  EEPROM.put(lastDataUpdateAddress, (uint32_t)0);
+  EEPROM.put(lastHumidityUpdateAddress, (uint32_t)0);
 
   EEPROM.write(intervalsAddress,0);
   EEPROM.commit();
@@ -570,11 +613,13 @@ void setupClock(){
   if (now < compiled) {
     Serial.println("Время часов меньше чем компилируемое");
     Rtc.SetDateTime(compiled);
+    now = compiled;
   } else if (now > compiled) {
     Serial.println("Время часов больше чем компилируемое");
   } else if (now == compiled) {
     Serial.println("Время часов равно компилируемому");
   }
+  lastDataUpdate = now;
 }
 
 void readIntervalsFromEEPROM(){

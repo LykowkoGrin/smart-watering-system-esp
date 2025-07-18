@@ -19,6 +19,10 @@ private:
   float* maxLitersPerMinute;
   uint8_t* ignoreAfterTurningOn;
   bool* flowExceededMaxValue;
+  RtcDateTime* lastDataUpdate;
+  RtcDateTime* lastHumidityUpdate;//время обновления влажности
+  int* humidity;
+  
 
   const bool* relayStatus;
   const float* lastLitersPerMinute;
@@ -37,8 +41,14 @@ private:
   void handleAddItem(AsyncWebServerRequest *request);
   void handleDeleteItem(AsyncWebServerRequest *request);
   void handleResetFlow(AsyncWebServerRequest *request);
+  void handleHumidity(AsyncWebServerRequest *request);
+  void handleM2M(AsyncWebServerRequest *request);
+  void handleM2ME(AsyncWebServerRequest *request);
+  void handleSetSystemTime(AsyncWebServerRequest *request);
 
   void handleError(AsyncWebServerRequest *request, const String& message);
+
+  void updateLastUpdateTime();
 };
 
 

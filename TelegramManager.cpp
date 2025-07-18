@@ -22,6 +22,7 @@ void TelegramManager::tickBot(const ChangePtrs& params){
   mutex = params.mutex;
 
   lastTimeBotRan = millis();
+  lastDataUpdate = params.lastDataUpdate;
   changePtrs = params;
   handleNewMessage();
 }
@@ -216,6 +217,8 @@ void TelegramManager::processChoose(){
         xSemaphoreTake(mutex, portMAX_DELAY);
         *changePtrs.flowExceededMaxValue = false;
         xSemaphoreGive(mutex);
+        
+        updateLastUpdateTime();
       }
       
       stage = processStage::none;
@@ -254,6 +257,8 @@ void TelegramManager::processTimer(){
     *changePtrs.stopTimerSec = now.TotalSeconds() + h * 3600 + m * 60;
     xSemaphoreGive(mutex);
   }
+
+  updateLastUpdateTime();
 
 
   stage = processStage::none;
@@ -301,6 +306,8 @@ void TelegramManager::processInterval(){
     xSemaphoreGive(mutex);
   }
 
+  updateLastUpdateTime();
+
   stage = processStage::none;
 }
 
@@ -334,6 +341,8 @@ void TelegramManager::processDelete(){
   
   (*changePtrs.intervals).erase((changePtrs.intervals)->begin()+index);
   xSemaphoreGive(mutex);
+
+  updateLastUpdateTime();
   stage = processStage::none;
 }
 
@@ -360,6 +369,8 @@ void TelegramManager::processTemperature(){
   *changePtrs.temperatureThreshold = tempVal;
   xSemaphoreGive(mutex);
 
+  updateLastUpdateTime();
+
   stage = processStage::none;
 }
 
@@ -385,6 +396,8 @@ void TelegramManager::processMaxFlow(){
   xSemaphoreTake(mutex, portMAX_DELAY);
   *changePtrs.maxLitersPerMinute = maxFlow;
   xSemaphoreGive(mutex);
+
+  updateLastUpdateTime();
 
   stage = processStage::none;
 }
@@ -418,5 +431,15 @@ void TelegramManager::processIgnoreCount(){
   *changePtrs.ignoreAfterTurningOn = num;
   xSemaphoreGive(mutex);
 
+  updateLastUpdateTime();
+
   stage = processStage::none;
+}
+
+void TelegramManager::updateLastUpdateTime(){
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  xSemaphoreTake(rtcMutex, portMAX_DELAY);
+  *lastDataUpdate = rtc->GetDateTime();
+  xSemaphoreGive(mutex);
+  xSemaphoreGive(rtcMutex);
 }
