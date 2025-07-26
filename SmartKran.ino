@@ -162,7 +162,7 @@ void checkWiFiConnection(void * parameter) {
       uint8_t reconnectAttempts = 0;
 
       xSemaphoreTake(mutex, portMAX_DELAY);
-      if((maxNoWiFiTime > millis() - lastConnTime) && (lastLitersPerMinute > maxLitersPerMinute)){
+      if((maxNoWiFiTime < millis() - lastConnTime) && (lastLitersPerMinute > maxLitersPerMinute)){
         ESP.restart();
       }
       xSemaphoreGive(mutex);
