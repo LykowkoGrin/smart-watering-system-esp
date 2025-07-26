@@ -448,9 +448,7 @@ void loop() {
     EEPROM.put(maxFlowAddress,maxLitersPerMinute);
 
     EEPROM.put(flowExceededMaxValueAddress,flowExceededMaxValue); 
-    EEPROM.put(humidityAddress,humidity);
     EEPROM.put(lastDataUpdateAddress,lastDataUpdate.TotalSeconds());
-    EEPROM.put(lastHumidityUpdateAddress,lastHumidityUpdate.TotalSeconds());
 
     EEPROM.commit();
 
@@ -459,6 +457,8 @@ void loop() {
   }
   if(lastHumidityUpdate != oldLastHumidityUpdate){
     oldLastHumidityUpdate = lastHumidityUpdate;
+    EEPROM.put(humidityAddress,humidity);
+    EEPROM.put(lastHumidityUpdateAddress,lastHumidityUpdate.TotalSeconds());
     Serial.println("Влажность обновлена");
   }
 
