@@ -38,8 +38,12 @@ const int humidityAddress = flowExceededMaxValueAddress + sizeof(bool); //
 const int lastDataUpdateAddress = humidityAddress + sizeof(int); //
 const int lastHumidityUpdateAddress = lastDataUpdateAddress + sizeof(uint32_t); //
 
-const int intervalsAddress = lastHumidityUpdateAddress + sizeof(uint32_t);
-const int eepromSize = intervalsAddress + 150;
+const int spilledWaterAddress = lastHumidityUpdateAddress + sizeof(uint32_t); //
+
+const int dryWaterValueAddress = spilledWaterAddress + sizeof(uint32_t); 
+const int wetWaterValueAddress = dryWaterValueAddress + sizeof(int);
+const int intervalsAddress = wetWaterValueAddress + sizeof(int); // Обновите адрес
+const int eepromSize = intervalsAddress + 150; // Увеличьте размер, если нужно
 
 const uint8_t eepromKey = 42;
 const float pulsesPerLiter = 450.0f;
@@ -87,6 +91,8 @@ struct WiFiParams {
 WiFiParams updatedWiFiParams;
 bool wifiParamsMustBeSaved = false;
 
+
+
 uint32_t stopTimerSec;
 float temperatureThreshold;
 std::vector<IntervalTime> intervals;
@@ -97,7 +103,11 @@ bool flowExceededMaxValue = false; //больше ничего и не надо 
 int humidity;
 RtcDateTime lastDataUpdate;//время обновления данных
 RtcDateTime lastHumidityUpdate;//время обновления влажности
+int dryWaterValue = 0;
+int wetWaterValue = 0;
 SemaphoreHandle_t mutex = xSemaphoreCreateMutex(); //это на строчки выше тема. Вотч демо вотч демо ww
+
+float spilledWater = 0.0f;
 
 ChangePtrs changePtrs;
 
@@ -162,7 +172,7 @@ void checkWiFiConnection(void * parameter) {
       uint8_t reconnectAttempts = 0;
 
       xSemaphoreTake(mutex, portMAX_DELAY);
-      if((maxNoWiFiTime < millis() - lastConnTime) && (lastLitersPerMinute > maxLitersPerMinute)){
+      if((maxNoWiFiTime > millis() - lastConnTime) && (lastLitersPerMinute < maxLitersPerMinute)){
         ESP.restart();
       }
       xSemaphoreGive(mutex);
@@ -242,6 +252,8 @@ void setup() {
   changePtrs.lastDataUpdate = &lastDataUpdate;
   changePtrs.lastHumidityUpdate = &lastHumidityUpdate;
   changePtrs.humidity = &humidity;
+  changePtrs.dryWaterValue = &dryWaterValue;
+  changePtrs.wetWaterValue = &wetWaterValue;
   changePtrs.mutex = mutex;
 
 
@@ -259,6 +271,7 @@ void setup() {
   constructPtrs.client = &client2;
   constructPtrs.bmpMutex = bmpMutex;
   constructPtrs.rtcMutex = rtcMutex;
+  constructPtrs.spilledWater = &spilledWater;
 
   localManager = new LocalManager(constructPtrs);
   localManager->setChangePtrs(changePtrs);
@@ -303,6 +316,9 @@ void setup() {
   EEPROM.get(humidityAddress, humidity);
   EEPROM.get(lastDataUpdateAddress, lastDataUpdateUINT);
   EEPROM.get(lastHumidityUpdateAddress, lastHumidityUpdateUINT);
+  EEPROM.get(spilledWaterAddress,spilledWater);
+  EEPROM.get(dryWaterValueAddress, dryWaterValue);
+  EEPROM.get(wetWaterValueAddress, wetWaterValue);
 
   lastDataUpdate = RtcDateTime(lastDataUpdateUINT);
   lastHumidityUpdate = RtcDateTime(lastHumidityUpdateUINT);
@@ -334,6 +350,8 @@ void setup() {
   //if(localManager != nullptr) xTaskCreatePinnedToCore(localServTask, "Task3", 65536, NULL, 1, NULL, tskNO_AFFINITY); //закоментил тк использую Async библеотеку
 }
 
+bool isMustSendTurnOffMessage = false;
+float turnOffSpilledWater = 0.0f;
 
 void botTask(void *pvParameters) {
 
@@ -352,6 +370,14 @@ void botTask(void *pvParameters) {
 
     if (WiFi.status() == WL_CONNECTED) telegramManager->tickBot(changePtrs); // Может быть долгим
 
+    if (isMustSendTurnOffMessage && bot != nullptr && WiFi.status() == WL_CONNECTED) {
+      String message = "🛑 Полив остановлен\n";
+      message += "💧 Вылито воды: " + String(turnOffSpilledWater, 2) + " л";
+      
+      if(bot->sendMessage(chatId, message)) {
+        isMustSendTurnOffMessage = false; // Сбрасываем флаг после отправки
+      }
+    }
 
     vTaskDelay(pdMS_TO_TICKS(1000));  // Ожидание в миллисекундах
   }
@@ -450,6 +476,9 @@ void loop() {
     EEPROM.put(flowExceededMaxValueAddress,flowExceededMaxValue); 
     EEPROM.put(lastDataUpdateAddress,lastDataUpdate.TotalSeconds());
 
+    EEPROM.put(dryWaterValueAddress, dryWaterValue);
+    EEPROM.put(wetWaterValueAddress, wetWaterValue);
+
     EEPROM.commit();
 
     oldLastDataUpdate = lastDataUpdate;
@@ -495,6 +524,8 @@ void loop() {
 
   if(millis() - lastFlowUpdate >= 60 * 1000){
 
+    spilledWater += lastLitersPerMinute;
+
     int currentPulseCount;
     portENTER_CRITICAL(&pulseCountMux);
     currentPulseCount = pulseCount;
@@ -506,6 +537,9 @@ void loop() {
     else flowUpdatesAfterTurningOn = 0;
 
     lastLitersPerMinute = currentPulseCount / pulsesPerLiter;
+
+    EEPROM.put(spilledWaterAddress,spilledWater);
+    EEPROM.commit();
 
     if(flowUpdatesAfterTurningOn > ignoreAfterTurningOn && lastLitersPerMinute > maxLitersPerMinute){
       flowExceededMaxValue = true;
@@ -541,13 +575,20 @@ void turnOnRelay(){
   if(!relayStatus){
     relayStatus = true;
     digitalWrite(relayPin,relayStatus);
+    spilledWater = 0.0f;
+    EEPROM.put(spilledWaterAddress,spilledWater);
+    EEPROM.commit();
   }
 }
 
 void turnOffRelay(){
   if(relayStatus){
+    // Фиксируем количество воды перед выключением
+    turnOffSpilledWater = spilledWater;
+    
     relayStatus = false;
-    digitalWrite(relayPin,relayStatus);
+    digitalWrite(relayPin, relayStatus);
+    isMustSendTurnOffMessage = true; // Устанавливаем флаг для отправки
   }
 }
 
@@ -565,6 +606,9 @@ void setupFirstTimeEEPROM(){
   EEPROM.put(humidityAddress, (int)0);
   EEPROM.put(lastDataUpdateAddress, (uint32_t)0);
   EEPROM.put(lastHumidityUpdateAddress, (uint32_t)0);
+  EEPROM.put(dryWaterValueAddress, 0); // Значения по умолчанию
+  EEPROM.put(wetWaterValueAddress, 0);
+  EEPROM.put(spilledWaterAddress, 0.0f);
 
   EEPROM.write(intervalsAddress,0);
   EEPROM.commit();

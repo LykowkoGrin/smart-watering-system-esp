@@ -19,7 +19,7 @@ struct ConstructPtrs{
   WiFiClientSecure* client;
   const bool* relayStatus;
   const float* lastLitersPerMinute;
-
+  const float* spilledWater;
 
 };
 struct ChangePtrs{
@@ -32,6 +32,8 @@ struct ChangePtrs{
   float* maxLitersPerMinute;
   uint8_t* ignoreAfterTurningOn;
   bool* flowExceededMaxValue;
+  int* dryWaterValue;
+  int* wetWaterValue;
 
   int* humidity;
 
