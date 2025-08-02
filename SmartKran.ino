@@ -135,85 +135,44 @@ void botTask(void *pvParameters);
 void mqttTask(void *pvParameters);
 void localServTask(void *pvParameters);
 
+unsigned long lastConnTime = 0;
+const unsigned long maxNoWiFiTime = 5 * 60 * 1000; // 5 минут
+
 void checkWiFiConnection(void * parameter) {
-  //WiFi.persistent(false);
-
-  //WiFi.mode(WIFI_STA);
-
-  //WiFi.disconnect(true);
-
-  //vTaskDelay(pdMS_TO_TICKS(5000));
-
   WiFiParams *params = (WiFiParams *) parameter;
   const uint8_t maxReconnectAttempts = 15;
-  const uint32_t maxNoWiFiTime = 5 * 60 * 1000;
-  uint32_t lastConnTime = millis();
-  bool isFirstConnect = true;
-
-  bool staticConnIsInited = (params->staticIP != IPAddress(0,0,0,0));
-  Serial.println("wifi params: ");
-
-  Serial.println(params->staticIP);
-  Serial.println(params->gateway);
-  Serial.println(params->subnet);
-  Serial.println(params->primaryDNS);
-  Serial.println(params->secondaryDNS);
-  Serial.println(staticConnIsInited);
-/*
-  if(staticConnIsInited) WiFi.config(params->staticIP, 
-                                      params->gateway, 
-                                      params->subnet, 
-                                      params->primaryDNS, 
-                                      params->secondaryDNS);
-*/
   bool serverIsRaised = false;
+
   for(;;) {
     if (WiFi.status() != WL_CONNECTED) {
-      uint8_t reconnectAttempts = 0;
-
-      xSemaphoreTake(mutex, portMAX_DELAY);
-      if((maxNoWiFiTime > millis() - lastConnTime) && (lastLitersPerMinute < maxLitersPerMinute)){
-        ESP.restart();
-      }
-      xSemaphoreGive(mutex);
-
+      // Пытаемся подключиться
       WiFi.begin(params->ssid, params->password);
-
-      
       Serial.print("Подключение к WiFi");
+      uint8_t reconnectAttempts = 0;
       while(WiFi.status() != WL_CONNECTED && maxReconnectAttempts > reconnectAttempts){
         reconnectAttempts++;
         Serial.print(".");
         vTaskDelay(1000 / portTICK_PERIOD_MS);
       }
       Serial.println();
+      
       if (WiFi.status() == WL_CONNECTED) {
-        lastConnTime = millis();
         Serial.println("Подключено к Wi-Fi");
         client.setInsecure();
         client2.setInsecure();
+        
         if(!serverIsRaised && localManager != nullptr) {
           localManager->raiseServer("smartgate");
           serverIsRaised = true;
         }
         
-
-        if(!staticConnIsInited){
-          updatedWiFiParams.staticIP = WiFi.localIP();
-          updatedWiFiParams.gateway = WiFi.gatewayIP();
-          updatedWiFiParams.subnet = WiFi.subnetMask();
-          updatedWiFiParams.primaryDNS = WiFi.dnsIP(0);
-          updatedWiFiParams.secondaryDNS = WiFi.dnsIP(1);
-
-          wifiParamsMustBeSaved = true;
-        }
-
-        
-      } else {
-        Serial.println("Не удалось подключиться к Wi-Fi");
+        // Обновляем время последнего подключения
+        xSemaphoreTake(mutex, portMAX_DELAY);
+        lastConnTime = millis();
+        xSemaphoreGive(mutex);
       }
     }
-    // Ждем 15 секунд перед следующей проверкой
+
     vTaskDelay(15'000 / portTICK_PERIOD_MS);
   }
 }
@@ -237,11 +196,28 @@ void setup() {
   EEPROM.begin(eepromSize);
 
   SettingsParser parser(parserAddress,false);
+  
   if(isParseSettingsMode){
     WiFi.softAP("Leonov's gate");
     parser.raiseServer("smartgate");
-    while(true) parser.tickServer();
+    
+    // Таймер для автоматической перезагрузки через 7 минут
+    const unsigned long settingsModeTimeout = 7 * 60 * 1000; // 7 минут
+    unsigned long settingsModeStartTime = millis();
+    
+    while(true) {
+      parser.tickServer();
+      
+      // Проверка времени работы в режиме настроек
+      if (millis() - settingsModeStartTime >= settingsModeTimeout) {
+          ESP.restart();
+      }
+      
+      delay(10); // Короткая пауза для стабильности
+    }
   }
+
+  lastConnTime = millis();
 
   changePtrs.intervals = &intervals;
   changePtrs.stopTimerSec = &stopTimerSec;
@@ -395,77 +371,27 @@ void mqttTask(void *pvParameters) {
 
 }
 
-/*
-void localServTask(void *pvParameters) {
-
-  while (true) {
-    ChangePtrs changePtrs;
-
-    if (xSemaphoreTake(mutex, portMAX_DELAY)) {
-      changePtrs.intervals = &intervals;
-      changePtrs.stopTimerSec = &stopTimerSec;
-      changePtrs.temperatureThreshold = &temperatureThreshold;
-      changePtrs.mutex = mutex;
-
-      xSemaphoreGive(mutex);
-    }
-
-    if (WiFi.status() == WL_CONNECTED) localManager->tickServer(changePtrs); // Может быть долгим
-
-
-    vTaskDelay(pdMS_TO_TICKS(300));  // Ожидание в миллисекундах
-  }
-}
-*/
-
-/*
-int oldIntervalsSize;
-uint32_t oldTimer;
-float oldThreshold;
-uint8_t oldIgnoreAfterTurningOn;
-float oldMaxLitersPerMinute;
-bool isFirstIter = true;
-
-
-*/
 bool isFirstIter = true;
 RtcDateTime oldLastDataUpdate;//время обновления данных
 RtcDateTime oldLastHumidityUpdate;//время обновления влажности
 void loop() {
   // put your main code here, to run repeatedly:
   xSemaphoreTake(mutex, portMAX_DELAY);
+
+  if (WiFi.status() != WL_CONNECTED && 
+      (millis() - lastConnTime > maxNoWiFiTime)) {
+    Serial.println("Wi-Fi отсутствует более 5 минут - перезагрузка");
+    xSemaphoreGive(mutex);
+    ESP.restart();
+  }
   
   if(isFirstIter){
-    //oldIntervalsSize = intervals.size();
-    //oldTimer = stopTimerSec;
-    //oldThreshold = temperatureThreshold;
-    //oldMaxLitersPerMinute = maxLitersPerMinute;
-    //oldIgnoreAfterTurningOn = ignoreAfterTurningOn;
+
     oldLastDataUpdate = lastDataUpdate;
     oldLastHumidityUpdate = lastHumidityUpdate;
     isFirstIter = false;
   }
-  /*
-  if(oldIntervalsSize != intervals.size()) {
-    saveIntervalsToEEPROM();
-  }
-  if(oldTimer != stopTimerSec){
-    EEPROM.put(timerAddress,stopTimerSec);
-    EEPROM.commit();
-  }
-  if(oldThreshold != temperatureThreshold){
-    EEPROM.put(temperatureAddress,temperatureThreshold);
-    EEPROM.commit();
-  }
-  if(oldIgnoreAfterTurningOn != ignoreAfterTurningOn){
-    EEPROM.put(ignoreCountAddress,ignoreAfterTurningOn); //
-    EEPROM.commit();
-  }
-  if(oldMaxLitersPerMinute != maxLitersPerMinute){
-    EEPROM.put(maxFlowAddress,maxLitersPerMinute); //
-    EEPROM.commit();
-  }
-  */
+
   if(lastDataUpdate != oldLastDataUpdate){
     saveIntervalsToEEPROM();
     EEPROM.put(timerAddress,stopTimerSec);
