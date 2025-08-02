@@ -89,6 +89,17 @@ void LocalManager::handleNewClient(AsyncWebServerRequest *request) {
 
   xSemaphoreTake(mutex, portMAX_DELAY);
 
+  int rawHumidity = *humidity;
+    bool rawMode = (*dryWaterValue == 0 && *wetWaterValue == 0);
+
+    float humidityPercent = 0.0;
+    if (!rawMode && *dryWaterValue != *wetWaterValue) {
+        int clamped = rawHumidity;
+        clamped = min(clamped, *dryWaterValue);
+        clamped = max(clamped, *wetWaterValue);
+        humidityPercent = 100.0f * (1.0f - float(clamped - *wetWaterValue) / (*dryWaterValue - *wetWaterValue));
+    }
+
   String stopTimerValue = *stopTimerSec ? String((int)((*stopTimerSec - nowSec) / 60)) : "";
 
   String html = "<html><head><meta charset='UTF-8'></head><body>";
@@ -97,7 +108,11 @@ void LocalManager::handleNewClient(AsyncWebServerRequest *request) {
   html += "<h2><b>Температура: " + String(nowTemp) + " °C</b></h2>";
   html += "<h2><b>Текущий расход: " + String(*lastLitersPerMinute) + " л/мин</b></h2>";
   html += "<h2><b>Превышение расхода: " + String(*flowExceededMaxValue ? "ДА" : "НЕТ") + "</b></h2>";
-  html += "<h2><b>Влажность почвы: " + String(*humidity) + "</b></h2>";
+  if (rawMode) {
+        html += "<h2><b>Влажность почвы: " + String(rawHumidity) + "</b></h2>";
+    } else {
+        html += "<h2><b>Влажность почвы: " + String(humidityPercent) + " %</b></h2>";
+    }
   html += "<form action='/reset_flow' method='POST'>";
   html += "<input type='submit' value='Сбросить превышение'>";
   html += "</form>";
@@ -494,27 +509,25 @@ void LocalManager::handleM2M(AsyncWebServerRequest *request) {
         doc["lastHumidityUpdate"] = lastHumidityUpdate->TotalSeconds();
         
         // 4. Показатели датчиков
-        doc["humidity"] = *humidity;
         doc["relayStatus"] = *relayStatus;
         doc["lastLitersPerMinute"] = *lastLitersPerMinute;
 
+        float outputHumidity;
+        if (*dryWaterValue == 0 && *wetWaterValue == 0) {
+          outputHumidity = *humidity;
+        } else if (*dryWaterValue != *wetWaterValue) {
+          int clamped = *humidity;
+          clamped = min(clamped, *dryWaterValue);
+          clamped = max(clamped, *wetWaterValue);
+          outputHumidity = 100.0f * (1.0f - float(clamped - *wetWaterValue) / (*dryWaterValue - *wetWaterValue));
+        } else {
+          outputHumidity = *humidity;
+        }
+
+        doc["humidity"] = outputHumidity;
+
         doc["dryWaterValue"] = *dryWaterValue;
         doc["wetWaterValue"] = *wetWaterValue;
-
-        // 5. Рассчитываем влажность в процентах
-        float humidityPercent = 0.0;
-        if (*dryWaterValue != *wetWaterValue) {
-            // Ограничиваем значение между dry и wet
-            int clampedHumidity = *humidity;
-            if (clampedHumidity > *dryWaterValue) clampedHumidity = *dryWaterValue;
-            if (clampedHumidity < *wetWaterValue) clampedHumidity = *wetWaterValue;
-            
-            // Линейное преобразование: 
-            // 0% при dryWaterValue, 100% при wetWaterValue
-            humidityPercent = 100.0 * (1.0 - static_cast<float>(clampedHumidity - *wetWaterValue) / 
-                                         (*dryWaterValue - *wetWaterValue));
-        }
-        doc["humidityPercent"] = humidityPercent;
 
         
         xSemaphoreGive(mutex);
