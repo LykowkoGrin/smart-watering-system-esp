@@ -65,53 +65,81 @@ void TelegramManager::processFirstMessage(){
   String chatId = bot->messages[messageCount - 1].chat_id;
   if(msg == "/полив"){
     bool isSend = bot->sendMessage(chatId, 
-"Введите число от 1 до 7:\n"
-"1 - установить таймер\n"
-"2 - добавить интервал включения полива\n"
-"3 - установить температурный порог включения полива\n"
-"4 - убрать один из интервалов включения полива\n"
-"5 - установить верхнюю границу потока воды\n"
-"6 - установить количество игнорируемых измерений после включения\n"
-"7 - возобновить полив");
+"Выберите действие:\n"
+"1 - Таймер полива\n"
+"2 - Добавить интервал\n"
+"3 - Температурный порог\n"
+"4 - Удалить интервал\n"
+"5 - Лимит расхода воды\n"
+"6 - Игнорируемые замеры\n"
+"7 - Возобновить полив");
     if(!isSend) stage = processStage::none;
     stage = processStage::chooseInput;
   }
   else if(msg == "/статус"){
-    xSemaphoreTake(mutex, portMAX_DELAY);
-    String intervalsInfo;
-    for(int i = 0 ; i < (changePtrs.intervals)->size(); i ++){
-      intervalsInfo += "\n" + (*changePtrs.intervals)[i].toString();
-    }
-
-    if((changePtrs.intervals)->size()){
-      intervalsInfo = "Интревалы включения полива: " + intervalsInfo;
-    }
-    else{
-      intervalsInfo = "Интревалы включения не указаны";
-    }
-
-    float nowTemp;
-    uint32_t nowSec;
+    // Считываем данные с датчиков
+    float nowTemp = 0;
+    uint32_t nowSec = 0;
+    int humidityVal = 0;
+    
     if (xSemaphoreTake(bmpMutex, portMAX_DELAY)){
       nowTemp = bmp->readTemperature();
       xSemaphoreGive(bmpMutex);
     }
-
+    
     if (xSemaphoreTake(rtcMutex, portMAX_DELAY)){
       nowSec = rtc->GetDateTime().TotalSeconds();
       xSemaphoreGive(rtcMutex);
     }
-
-    uint32_t timeToStop = *changePtrs.stopTimerSec - nowSec;
-    String timerInfo = *changePtrs.stopTimerSec == 0 ? "Таймер выключен" : "Остановка таймера через " + String(timeToStop / 60.f) + " минут";
-    String relayInfo = *relayStatus ? "Полив включен" : "Полив выключен";
-    String temperatureInfo = "Температурный порог: " + String(*changePtrs.temperatureThreshold) + ". Актуальная температура: " + String(nowTemp);
-    String flowInfo1 = "Поток л/мин: " + String(*lastLitersPerMinute);
-    String flowInfo2 = "Верхняя граница потока: " + String(*changePtrs.maxLitersPerMinute);
-    String flowInfo3 = "Количество измерений потока до принятия решения: " + String(*changePtrs.ignoreAfterTurningOn);
-    String flowInfo4 = *changePtrs.flowExceededMaxValue ? "Полив заблокирован" : "Поток НЕ заблокирован";
+    
+    // Защищенный доступ к общим данным через мьютекс
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    
+    humidityVal = *changePtrs.humidity;  // Новое поле влажности
+    
+    // Формирование понятного статуса
+    String statusMessage = "📊 СТАТУС СИСТЕМЫ ПОЛИВА\n\n";
+    
+    // 1. Интервалы полива
+    if(changePtrs.intervals->size() > 0) {
+      statusMessage += "⏰ Интервалы полива:\n";
+      for(int i = 0; i < changePtrs.intervals->size(); i++) {
+        statusMessage += " - " + (*changePtrs.intervals)[i].toString() + "\n";
+      }
+    } else {
+      statusMessage += "⏰ Интервалы полива: не заданы\n";
+    }
+    statusMessage += "\n";
+    
+    // 2. Таймер
+    if(*changePtrs.stopTimerSec > nowSec) {
+      uint32_t timeLeft = *changePtrs.stopTimerSec - nowSec;
+      uint8_t hours = timeLeft / 3600;
+      uint8_t minutes = (timeLeft % 3600) / 60;
+      statusMessage += "⏳ Таймер: полив остановится через " + String(hours) + "ч " + String(minutes) + "м\n";
+    } else {
+      statusMessage += "⏳ Таймер: не активен\n";
+    }
+    
+    // 3. Температура и влажность
+    statusMessage += "🌡️ Температура: " + String(nowTemp) + "°C (порог: " + String(*changePtrs.temperatureThreshold) + "°C)\n";
+    statusMessage += "💧 Влажность: " + String(humidityVal) + "%\n\n";  // Новый показатель
+    
+    // 4. Состояние полива
+    statusMessage += *relayStatus ? "✅ ПОЛИВ АКТИВЕН\n" : "⛔ ПОЛИВ ВЫКЛЮЧЕН\n";
+    
+    // 5. Данные о воде
+    statusMessage += "💧 Текущий расход: " + String(*lastLitersPerMinute) + " л/мин\n";
+    statusMessage += "⚠️ Макс. расход: " + String(*changePtrs.maxLitersPerMinute) + " л/мин\n";
+    statusMessage += "🛡️ Игнорируемых замеров: " + String(*changePtrs.ignoreAfterTurningOn) + "\n";
+    
+    // 6. Блокировки
+    if(*changePtrs.flowExceededMaxValue) {
+      statusMessage += "\n🚫 ВНИМАНИЕ: Полив заблокирован из-за превышения расхода!";
+    }
+    
     xSemaphoreGive(mutex);
-    bot->sendMessage(chatId, intervalsInfo + "\n" + timerInfo + "\n" + temperatureInfo + "\n" + relayInfo + "\n" + flowInfo1 + "\n" + flowInfo2 + "\n" + flowInfo3 + "\n" + flowInfo4);
+    bot->sendMessage(chatId, statusMessage);
   }
 }
 

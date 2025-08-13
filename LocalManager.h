@@ -22,6 +22,9 @@ private:
   RtcDateTime* lastDataUpdate;
   RtcDateTime* lastHumidityUpdate;//время обновления влажности
   int* humidity;
+
+  int* dryWaterValue;
+  int* wetWaterValue;
   
 
   const bool* relayStatus;
@@ -45,6 +48,7 @@ private:
   void handleM2M(AsyncWebServerRequest *request);
   void handleM2ME(AsyncWebServerRequest *request);
   void handleSetSystemTime(AsyncWebServerRequest *request);
+  void handleStartWatering(AsyncWebServerRequest *request);
 
   void handleError(AsyncWebServerRequest *request, const String& message);
 

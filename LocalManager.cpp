@@ -59,6 +59,10 @@ void LocalManager::raiseServer(const String& serverName){
       handleHumidity(request);
     });
 
+    server->on("/start_watering", HTTP_POST, [this](AsyncWebServerRequest *request) {
+        handleStartWatering(request);
+    });
+
     server->begin();
 
     if (!MDNS.begin(serverName.c_str())) {
@@ -85,6 +89,17 @@ void LocalManager::handleNewClient(AsyncWebServerRequest *request) {
 
   xSemaphoreTake(mutex, portMAX_DELAY);
 
+  int rawHumidity = *humidity;
+    bool rawMode = (*dryWaterValue == 0 && *wetWaterValue == 0);
+
+    float humidityPercent = 0.0;
+    if (!rawMode && *dryWaterValue != *wetWaterValue) {
+        int clamped = rawHumidity;
+        clamped = min(clamped, *dryWaterValue);
+        clamped = max(clamped, *wetWaterValue);
+        humidityPercent = 100.0f * (1.0f - float(clamped - *wetWaterValue) / (*dryWaterValue - *wetWaterValue));
+    }
+
   String stopTimerValue = *stopTimerSec ? String((int)((*stopTimerSec - nowSec) / 60)) : "";
 
   String html = "<html><head><meta charset='UTF-8'></head><body>";
@@ -93,7 +108,11 @@ void LocalManager::handleNewClient(AsyncWebServerRequest *request) {
   html += "<h2><b>Температура: " + String(nowTemp) + " °C</b></h2>";
   html += "<h2><b>Текущий расход: " + String(*lastLitersPerMinute) + " л/мин</b></h2>";
   html += "<h2><b>Превышение расхода: " + String(*flowExceededMaxValue ? "ДА" : "НЕТ") + "</b></h2>";
-  html += "<h2><b>Влажность почвы: " + String(*humidity) + "</b></h2>";
+  if (rawMode) {
+        html += "<h2><b>Влажность почвы: " + String(rawHumidity) + "</b></h2>";
+    } else {
+        html += "<h2><b>Влажность почвы: " + String(humidityPercent) + " %</b></h2>";
+    }
   html += "<form action='/reset_flow' method='POST'>";
   html += "<input type='submit' value='Сбросить превышение'>";
   html += "</form>";
@@ -106,6 +125,10 @@ void LocalManager::handleNewClient(AsyncWebServerRequest *request) {
   html += "Температурный порог (°C): <input type='text' name='temperature_threshold' value='" + String(*temperatureThreshold) + "'><br>";
   html += "<input type='submit' value='Сохранить'>";
   html += "</form><br>";
+
+  html += "<h2>Настройки влажности</h2>";
+  html += "Сухая почва (%): <input type='text' name='dry_water' value='" + String(*dryWaterValue) + "'><br>";
+  html += "Влажная почва (%): <input type='text' name='wet_water' value='" + String(*wetWaterValue) + "'><br>";
 
   html += "<h2>Список интервалов включения</h2>";
   html += "<ul>";
@@ -236,6 +259,37 @@ void LocalManager::handleSubmit(AsyncWebServerRequest *request){
     *temperatureThreshold = parsedTemp;
     xSemaphoreGive(mutex);
     updateLastUpdateTime();
+  }
+
+  if (request->hasArg("dry_water")) {
+    String dryStr = request->arg("dry_water");
+    try {
+      int parsedDry = std::stoi(dryStr.c_str());
+      xSemaphoreTake(mutex, portMAX_DELAY);
+      *dryWaterValue = parsedDry;
+      xSemaphoreGive(mutex);
+      updateLastUpdateTime();
+    } 
+    catch(std::exception& ex) {
+      handleError(request, "Неверный формат значения сухой почвы");
+      return;
+    }
+  }
+
+  // Обработка wet_water
+  if (request->hasArg("wet_water")) {
+    String wetStr = request->arg("wet_water");
+    try {
+      int parsedWet = std::stoi(wetStr.c_str());
+      xSemaphoreTake(mutex, portMAX_DELAY);
+      *wetWaterValue = parsedWet;
+      xSemaphoreGive(mutex);
+      updateLastUpdateTime();
+    } 
+    catch(std::exception& ex) {
+      handleError(request, "Неверный формат значения влажной почвы");
+      return;
+    }
   }
 
 
@@ -455,9 +509,26 @@ void LocalManager::handleM2M(AsyncWebServerRequest *request) {
         doc["lastHumidityUpdate"] = lastHumidityUpdate->TotalSeconds();
         
         // 4. Показатели датчиков
-        doc["humidity"] = *humidity;
         doc["relayStatus"] = *relayStatus;
         doc["lastLitersPerMinute"] = *lastLitersPerMinute;
+
+        float outputHumidity;
+        if (*dryWaterValue == 0 && *wetWaterValue == 0) {
+          outputHumidity = *humidity;
+        } else if (*dryWaterValue != *wetWaterValue) {
+          int clamped = *humidity;
+          clamped = min(clamped, *dryWaterValue);
+          clamped = max(clamped, *wetWaterValue);
+          outputHumidity = 100.0f * (1.0f - float(clamped - *wetWaterValue) / (*dryWaterValue - *wetWaterValue));
+        } else {
+          outputHumidity = *humidity;
+        }
+
+        doc["humidity"] = outputHumidity;
+
+        doc["dryWaterValue"] = *dryWaterValue;
+        doc["wetWaterValue"] = *wetWaterValue;
+
         
         xSemaphoreGive(mutex);
         
@@ -470,6 +541,47 @@ void LocalManager::handleM2M(AsyncWebServerRequest *request) {
     } else {
         request->send(500, "application/json", "{\"error\":\"mutex_timeout\"}");
     }
+}
+
+void LocalManager::handleStartWatering(AsyncWebServerRequest *request) {
+    // Проверяем наличие параметра duration
+    if (!request->hasParam("duration", true)) {
+        handleError(request, "Отсутствует параметр duration");
+        return;
+    }
+
+    // Парсим значение duration
+    String durationStr = request->getParam("duration", true)->value();
+    int durationMinutes;
+    try {
+        durationMinutes = std::stoi(durationStr.c_str());
+        if (durationMinutes <= 0) throw std::exception();
+    } 
+    catch(std::exception&) {
+        handleError(request, "Неверный формат длительности. Ожидается целое число > 0");
+        return;
+    }
+
+    // Рассчитываем время остановки
+    uint32_t nowSec;
+    if (xSemaphoreTake(rtcMutex, portMAX_DELAY) == pdTRUE) {
+        nowSec = rtc->GetDateTime().TotalSeconds();
+        xSemaphoreGive(rtcMutex);
+    } else {
+        handleError(request, "Ошибка доступа к RTC");
+        return;
+    }
+
+    // Устанавливаем таймер и включаем реле
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    *stopTimerSec = nowSec + durationMinutes * 60;
+    xSemaphoreGive(mutex);
+    updateLastUpdateTime();
+
+    // Редирект на главную страницу
+    AsyncWebServerResponse *response = request->beginResponse(303);
+    response->addHeader("Location", "/");
+    request->send(response);
 }
 
 /*
@@ -496,6 +608,8 @@ void LocalManager::setChangePtrs(const ChangePtrs& params){
   this->lastDataUpdate = params.lastDataUpdate;
   this->lastHumidityUpdate = params.lastHumidityUpdate;
   this->humidity = params.humidity;
+  this->dryWaterValue = params.dryWaterValue;
+  this->wetWaterValue = params.wetWaterValue;
   this->mutex = params.mutex;
 }
 
@@ -631,6 +745,19 @@ void LocalManager::handleM2ME(AsyncWebServerRequest *request) {
                 xSemaphoreGive(rtcMutex);
             }
             responseMsg += "\"humidity\":\"updated\",";
+        }
+
+        // 5. Обновление параметров влажности
+        if (doc.containsKey("dryWaterValue")) {
+            *dryWaterValue = doc["dryWaterValue"].as<int>();
+            updateNeeded = true;
+            responseMsg += "\"dryWaterValue\":\"updated\",";
+        }
+        
+        if (doc.containsKey("wetWaterValue")) {
+            *wetWaterValue = doc["wetWaterValue"].as<int>();
+            updateNeeded = true;
+            responseMsg += "\"wetWaterValue\":\"updated\",";
         }
 
         // Финализируем ответ
